@@ -28,12 +28,29 @@ limitations under the License. */
 #include "paddle/fluid/framework/ir/node.h"
 
 namespace paddle {
+namespace framework {
+class BlockDesc;
+}  // namespace framework
+}  // namespace paddle
+
+namespace paddle {
 namespace inference {
 namespace analysis {
-using framework::ir::Node;
 
 std::vector<std::string> ExtractParameters(
-    const std::unordered_set<Node *> &nodes);
+    const std::unordered_set<framework::ir::Node *> &nodes,
+    bool sorted = false);
+
+std::unordered_set<framework::ir::Node *> GetRelatedIOVarNodes(
+    const std::vector<framework::ir::Node *> &nodes);
+
+void PrependFeedOps(framework::BlockDesc *global_block,
+                    const std::vector<std::string> &feed_target_names,
+                    std::string feed_holder_name = "feed");
+
+void PrependFetchOps(framework::BlockDesc *global_block,
+                     const std::vector<std::string> &fetch_target_names,
+                     std::string fetch_holder_name = "fetch");
 
 void RenameAndGetOutputs(
     const std::vector<framework::ir::Node *> &subgraph_nodes,
@@ -42,7 +59,8 @@ void RenameAndGetOutputs(
     std::set<std::string> *output_names_with_id,
     std::set<std::string> *output_names,
     std::unordered_map<std::string, std::string> *output_name_map,
-    bool is_trt = true);
+    const std::unordered_map<std::string, framework::ir::Node *> &graph_var_map,
+    bool trt_and_not_int8 = false);
 
 }  // namespace analysis
 }  // namespace inference

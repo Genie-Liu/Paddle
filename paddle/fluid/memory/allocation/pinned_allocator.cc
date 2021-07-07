@@ -13,27 +13,27 @@
 // limitations under the License.
 
 #include "paddle/fluid/memory/allocation/pinned_allocator.h"
-#include <cuda.h>
-#include <cuda_runtime.h>
 
 namespace paddle {
 namespace memory {
 namespace allocation {
 bool CPUPinnedAllocator::IsAllocThreadSafe() const { return true; }
-void CPUPinnedAllocator::Free(Allocation *allocation) {
-  PADDLE_ENFORCE_NOT_NULL(dynamic_cast<CPUPinnedAllocation *>(allocation));
-  PADDLE_ENFORCE(cudaFreeHost(allocation->ptr()));
+void CPUPinnedAllocator::FreeImpl(Allocation *allocation) {
+#ifdef PADDLE_WITH_HIP
+  PADDLE_ENFORCE_CUDA_SUCCESS(hipHostFree(allocation->ptr()));
+#else
+  PADDLE_ENFORCE_CUDA_SUCCESS(cudaFreeHost(allocation->ptr()));
+#endif
   delete allocation;
 }
-Allocation *CPUPinnedAllocator::AllocateImpl(size_t size,
-                                             Allocator::Attr attr) {
-  // PADDLE_ENFORCE_EQ(
-  //    attr, kCrossDevice,
-  //    "CPUPinnedAllocator should be used for Cross-Device Communication");
-
+Allocation *CPUPinnedAllocator::AllocateImpl(size_t size) {
   void *ptr;
-  PADDLE_ENFORCE(cudaHostAlloc(&ptr, size, cudaHostAllocPortable));
-  return new CPUPinnedAllocation(ptr, size);
+#ifdef PADDLE_WITH_HIP
+  PADDLE_ENFORCE_CUDA_SUCCESS(hipHostMalloc(&ptr, size, hipHostMallocPortable));
+#else
+  PADDLE_ENFORCE_CUDA_SUCCESS(cudaHostAlloc(&ptr, size, cudaHostAllocPortable));
+#endif
+  return new Allocation(ptr, size, platform::CUDAPinnedPlace());
 }
 }  // namespace allocation
 }  // namespace memory

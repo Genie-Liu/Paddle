@@ -18,6 +18,8 @@
 #include "paddle/fluid/platform/place.h"
 
 #include "paddle/fluid/framework/op_proto_maker.h"
+#include "paddle/fluid/framework/op_version_registry.h"
+#include "paddle/fluid/imperative/type_defs.h"
 
 namespace paddle {
 namespace framework {
@@ -29,8 +31,19 @@ void SetOp(ProgramDesc* prog, const std::string& type, const std::string& name,
   auto* op = prog->MutableBlock(0)->AppendOp();
   op->SetType(type);
   if (type == "conv2d") {
+    const std::vector<int> strides({1, 1});
+    const std::vector<int> paddings({0, 0});
+    const std::vector<int> dilations({1, 1});
     op->SetAttr("use_mkldnn", true);
     op->SetAttr("name", name);
+    op->SetAttr("strides", strides);
+    op->SetAttr("groups", 1);
+    op->SetAttr("paddings", paddings);
+    op->SetAttr("padding_algorithm", std::string("EXPLICIT"));
+    op->SetAttr("dilations", dilations);
+    op->SetAttr("data_format", std::string("NCHW"));
+
+    op->SetOutput("Output", outputs);
     op->SetInput("Input", {inputs[0]});
     op->SetInput("Filter", {inputs[1]});
     if (inputs.size() > 2)
@@ -39,10 +52,11 @@ void SetOp(ProgramDesc* prog, const std::string& type, const std::string& name,
       op->SetInput("Bias", {});
   } else if (type == "elementwise_add") {
     op->SetAttr("use_mkldnn", true);
+    op->SetAttr("axis", -1);
     op->SetInput("X", {inputs[0]});
     op->SetInput("Y", {inputs[1]});
+    op->SetOutput("Out", outputs);
   }
-  op->SetOutput("Out", outputs);
   op->SetAttr(OpProtoAndCheckerMaker::OpRoleAttrName(),
               static_cast<int>(OpRole::kForward));
 }
@@ -81,8 +95,7 @@ void InitTensorHolder(Scope* scope, const paddle::platform::Place& place,
                       const char* var_name) {
   auto x = scope->Var(var_name);
   auto tensor = x->GetMutable<LoDTensor>();
-  tensor->mutable_data(place, proto::VarType::FP32,
-                       ::paddle::memory::Allocator::kDefault, 1);
+  tensor->mutable_data(place, proto::VarType::FP32, 1);
 }
 
 void MainTest(bool convWithExistingBias) {
@@ -97,7 +110,7 @@ void MainTest(bool convWithExistingBias) {
     InitTensorHolder(&scope, place, "conv_bias");
     InitTensorHolder(&scope, place, "eltwise_bias");
   }
-  graph->Set(kParamScopeAttr, new framework::Scope*(&scope));
+  graph->SetNotOwned(kParamScopeAttr, &scope);
 
   auto pass = PassRegistry::Instance().Get("conv_bias_mkldnn_fuse_pass");
 
@@ -118,14 +131,14 @@ void MainTest(bool convWithExistingBias) {
     if (node->IsOp() && node->Op()->Type() == "conv2d") {
       auto* op = node->Op();
       ASSERT_TRUE(op->HasAttr("use_mkldnn"));
-      EXPECT_TRUE(boost::get<bool>(op->GetAttr("use_mkldnn")));
+      EXPECT_TRUE(BOOST_GET_CONST(bool, op->GetAttr("use_mkldnn")));
       // check if "conv" convolution is fused
-      auto op_name = boost::get<std::string>(op->GetAttr("name"));
+      auto op_name = BOOST_GET_CONST(std::string, op->GetAttr("name"));
       if (op_name == "conv") {
         auto input_names = op->InputNames();
         ASSERT_TRUE(std::find(input_names.begin(), input_names.end(), "Bias") !=
                     input_names.end());
-        auto bias = boost::get<std::vector<std::string>>(op->Input("Bias"));
+        auto bias = op->Input("Bias");
         if (bias.size()) {
           ++conv_bias_count;
         }
@@ -141,7 +154,18 @@ TEST(ConvBiasFusePass, conv_with_existing_bias) { MainTest(true); }
 
 TEST(ConvBiasFusePass, conv3d) {
   Conv3DBiasFusePass pass;
-  ASSERT_TRUE(pass.is_conv3d());
+  ASSERT_EQ(pass.type(), std::string("conv3d"));
+}
+
+TEST(ConvBiasFusePass, conv2d_transpose) {
+  Conv2DTransposeBiasFusePass pass;
+  ASSERT_EQ(pass.type(), std::string("conv2d_transpose"));
+}
+
+TEST(ConvBiasFusePass, pass_op_version_check) {
+  ASSERT_TRUE(
+      paddle::framework::compatible::PassVersionCheckerRegistrar::GetInstance()
+          .IsPassCompatible("conv_bias_mkldnn_fuse_pass"));
 }
 
 }  // namespace ir

@@ -102,8 +102,6 @@ class TestDistSaveLoad2x2(TestDistSimnetBow2x2):
         test_program, avg_cost, train_reader, test_reader, batch_acc, predict = \
             self.get_model(batch_size=2)
 
-        if args.mem_opt:
-            fluid.memory_optimize(fluid.default_main_program(), skip_grads=True)
         if args.update_method == "pserver":
             t = self.get_transpiler(args.trainer_id,
                                     fluid.default_main_program(),
@@ -124,7 +122,6 @@ class TestDistSaveLoad2x2(TestDistSimnetBow2x2):
 
         strategy = fluid.ExecutionStrategy()
         strategy.num_threads = 1
-        strategy.allow_op_delay = False
 
         build_stra = fluid.BuildStrategy()
 
@@ -172,10 +169,7 @@ class TestDistSaveLoad2x2(TestDistSimnetBow2x2):
 
             var = np.array(fluid.global_scope().find_var('__fc_b__').get_tensor(
             ))
-            if six.PY2:
-                print(pickle.dumps(np.ravel(var).tolist()))
-            else:
-                sys.stdout.buffer.write(pickle.dumps(np.ravel(var).tolist()))
+            sys.stdout.buffer.write(pickle.dumps(np.ravel(var).tolist()))
 
         elif save_mode == "DIST":
             skip_steps = int(os.getenv("SKIP_STEPS"))
@@ -194,10 +188,7 @@ class TestDistSaveLoad2x2(TestDistSimnetBow2x2):
                         continue
                     loss, = exe.run(fetch_list=[avg_cost.name],
                                     feed=feeder.feed(data))
-            if six.PY2:
-                print(pickle.dumps(loss.tolist()))
-            else:
-                sys.stdout.buffer.write(pickle.dumps(loss.tolist()))
+            sys.stdout.buffer.write(pickle.dumps(loss.tolist()))
         else:
             raise Exception("save_mode must be LOCAL or DIST")
 

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 #include "paddle/fluid/framework/ir/conv_elementwise_add_act_fuse_pass.h"
-#include <string>
-#include "paddle/fluid/framework/ir/graph_viz_pass.h"
+
+#include "paddle/fluid/framework/op_version_registry.h"
 
 namespace paddle {
 namespace framework {
@@ -31,7 +31,7 @@ namespace ir {
   GET_IR_NODE(act_op);               \
   GET_IR_NODE(act_out);
 
-// Inherient the basic infomation from `base_desc`, and modify some fields.
+// Inherient the basic information from `base_desc`, and modify some fields.
 framework::proto::OpDesc PrepareOpDesc(
     const framework::proto::OpDesc& base_desc, const std::string& bias,
     const std::string& activation, const std::string& output) {
@@ -46,6 +46,60 @@ framework::proto::OpDesc PrepareOpDesc(
   desc.SetAttr("use_cudnn", false);
   desc.Flush();
   return *desc.Proto();
+}
+
+ConvElementwiseAddActFusePass::ConvElementwiseAddActFusePass() {
+  AddOpCompat(OpCompat("conv2d"))
+      .AddInput("Input")
+      .IsTensor()
+      .End()
+      .AddInput("Filter")
+      .IsTensor()
+      .End()
+      .AddInput("ResidualData")
+      .IsOptional()
+      .End()
+      .AddOutput("Output")
+      .IsTensor()
+      .End()
+      .AddAttr("strides")
+      .End()
+      .AddAttr("paddings")
+      .End()
+      .AddAttr("padding_algorithm")
+      .IsOptional()
+      .IsStringIn({"EXPLICIT", "SAME", "VALID"})
+      .End()
+      .AddAttr("groups")
+      .IsNumGE(1)
+      .End()
+      .AddAttr("dilations")
+      .End()
+      .AddAttr("data_format")
+      .IsStringIn({"NCHW", "NHWC", "AnyLayout"})
+      .End();
+
+  AddOpCompat(OpCompat("elementwise_add"))
+      .AddInput("X")
+      .IsTensor()
+      .End()
+      .AddInput("Y")
+      .IsTensor()
+      .End()
+      .AddOutput("Out")
+      .IsTensor()
+      .End()
+      .AddAttr("axis")
+      .IsNumEQ(1)
+      .End();
+
+  AddOpCompat(OpCompat("relu"))
+      .AddInput("X")
+      .IsTensor()
+      .End()
+      .AddOutput("Out")
+      .IsTensor()
+      .End();
 }
 
 void ConvElementwiseAddActFusePass::ApplyImpl(ir::Graph* graph) const {
@@ -63,6 +117,10 @@ void ConvElementwiseAddActFusePass::ApplyImpl(ir::Graph* graph) const {
 
   auto handler = [&](const GraphPatternDetector::subgraph_t& subgraph,
                      Graph* g) {
+    if (!IsCompat(subgraph, g)) {
+      LOG(WARNING) << "Pass in op compat failed.";
+      return;
+    }
     GET_NODES;
 
     auto base_op_desc = *conv_op->Op()->Proto();
@@ -78,7 +136,9 @@ void ConvElementwiseAddActFusePass::ApplyImpl(ir::Graph* graph) const {
     auto* new_conv_op = graph->CreateOpNode(&new_op_desc);
 
     // Link inputs and outputs.
-    PADDLE_ENFORCE(subgraph.count(x));
+    PADDLE_ENFORCE_NE(
+        subgraph.count(x), 0,
+        platform::errors::NotFound("Detector did not find input x of conv2d."));
     auto* conv_in_node = subgraph.at(x);
 
     IR_NODE_LINK_TO(conv_in_node, new_conv_op);          // Input
@@ -100,3 +160,10 @@ void ConvElementwiseAddActFusePass::ApplyImpl(ir::Graph* graph) const {
 
 REGISTER_PASS(conv_elementwise_add_act_fuse_pass,
               paddle::framework::ir::ConvElementwiseAddActFusePass);
+REGISTER_PASS_CAPABILITY(conv_elementwise_add_act_fuse_pass)
+    .AddCombination(
+        paddle::framework::compatible::OpVersionComparatorCombination()
+            .LE("conv2d", 1)
+            .LE("elementwise_add", 1)
+            .EQ("relu", 0)
+            .EQ("identity", 0));

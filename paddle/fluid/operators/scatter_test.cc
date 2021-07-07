@@ -13,10 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include "paddle/fluid/operators/scatter.h"
+
 #include <gtest/gtest.h>
-#include <iostream>
-#include <string>
-#include "paddle/fluid/framework/ddim.h"
+
 #include "paddle/fluid/framework/tensor.h"
 #include "paddle/fluid/platform/place.h"
 
@@ -55,4 +54,6 @@ TEST(scatter, ScatterUpdate) {
     EXPECT_EQ(output.data<float>()[i], static_cast<float>(i - 4));
   for (size_t i = 8; i < 16; ++i) EXPECT_EQ(p_output[i], 0.0f);
   for (size_t i = 8; i < 16; ++i) EXPECT_EQ(output.data<float>()[i], 0.0f);
+
+  delete cpu_place;
 }

@@ -27,7 +27,7 @@ the image layout as follows.
 
   OpenCV use BGR color format. PIL use RGB color format. Both
   formats can be used for training. Noted that, the format should
-  be keep consistent between the training and inference peroid.
+  be keep consistent between the training and inference period.
 """
 
 from __future__ import print_function
@@ -58,11 +58,7 @@ import os
 import tarfile
 import six.moves.cPickle as pickle
 
-__all__ = [
-    "load_image_bytes", "load_image", "resize_short", "to_chw", "center_crop",
-    "random_crop", "left_right_flip", "simple_transform", "load_and_transform",
-    "batch_images_from_tar"
-]
+__all__ = []
 
 
 def _check_cv2():
@@ -97,8 +93,8 @@ def batch_images_from_tar(data_file,
     :rtype: string
     """
     batch_dir = data_file + "_batch"
-    out_path = "%s/%s" % (batch_dir, dataset_name)
-    meta_file = "%s/%s.txt" % (batch_dir, dataset_name)
+    out_path = "%s/%s_%s" % (batch_dir, dataset_name, os.getpid())
+    meta_file = "%s/%s_%s.txt" % (batch_dir, dataset_name, os.getpid())
 
     if os.path.exists(out_path):
         return meta_file

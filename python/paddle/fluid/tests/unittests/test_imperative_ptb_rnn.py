@@ -15,26 +15,28 @@
 from __future__ import print_function
 
 import unittest
+import paddle
 import paddle.fluid as fluid
+import paddle.fluid.core as core
 from paddle.fluid.dygraph.nn import Embedding
 import paddle.fluid.framework as framework
 from paddle.fluid.optimizer import SGDOptimizer
 from paddle.fluid.dygraph.base import to_variable
+from paddle.fluid.dygraph import TracedLayer
 from test_imperative_base import new_program_scope
 import numpy as np
 import six
-from paddle.fluid.backward import append_backward
+from utils import DyGraphProgramDescTracerTestHelper, is_equal_program
 
 
-class SimpleLSTMRNN(fluid.dygraph.Layer):
+class SimpleLSTMRNN(fluid.Layer):
     def __init__(self,
-                 name_scope,
                  hidden_size,
                  num_steps,
                  num_layers=2,
                  init_scale=0.1,
                  dropout=None):
-        super(SimpleLSTMRNN, self).__init__(name_scope)
+        super(SimpleLSTMRNN, self).__init__()
         self._hidden_size = hidden_size
         self._num_layers = num_layers
         self._init_scale = init_scale
@@ -43,8 +45,9 @@ class SimpleLSTMRNN(fluid.dygraph.Layer):
         self._num_steps = num_steps
         self.cell_array = []
         self.hidden_array = []
+        self._create_parameter()
 
-    def _build_once(self, input_embedding, init_hidden=None, init_cell=None):
+    def _create_parameter(self):
         self.weight_1_arr = []
         self.weight_2_arr = []
         self.bias_arr = []
@@ -131,16 +134,16 @@ class SimpleLSTMRNN(fluid.dygraph.Layer):
         return real_res, last_hidden, last_cell
 
 
-class PtbModel(fluid.dygraph.Layer):
+class PtbModel(fluid.Layer):
     def __init__(self,
-                 name_scope,
                  hidden_size,
                  vocab_size,
                  num_layers=2,
                  num_steps=20,
                  init_scale=0.1,
+                 is_sparse=False,
                  dropout=None):
-        super(PtbModel, self).__init__(name_scope)
+        super(PtbModel, self).__init__()
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.init_scale = init_scale
@@ -148,17 +151,15 @@ class PtbModel(fluid.dygraph.Layer):
         self.num_steps = num_steps
         self.dropout = dropout
         self.simple_lstm_rnn = SimpleLSTMRNN(
-            self.full_name(),
             hidden_size,
             num_steps,
             num_layers=num_layers,
             init_scale=init_scale,
             dropout=dropout)
         self.embedding = Embedding(
-            self.full_name(),
             size=[vocab_size, hidden_size],
             dtype='float32',
-            is_sparse=False,
+            is_sparse=is_sparse,
             param_attr=fluid.ParamAttr(
                 name='embedding_para',
                 initializer=fluid.initializer.UniformInitializer(
@@ -175,9 +176,6 @@ class PtbModel(fluid.dygraph.Layer):
             dtype="float32",
             default_initializer=fluid.initializer.UniformInitializer(
                 low=-self.init_scale, high=self.init_scale))
-
-    def _build_once(self, input, label, init_hidden, init_cell):
-        pass
 
     def forward(self, input, label, init_hidden, init_cell):
         init_h = fluid.layers.reshape(
@@ -202,20 +200,21 @@ class PtbModel(fluid.dygraph.Layer):
         projection = fluid.layers.elementwise_add(projection, self.softmax_bias)
         projection = fluid.layers.reshape(
             projection, shape=[-1, self.vocab_size])
-        projection = fluid.layers.reshape(
-            projection, shape=[-1, self.vocab_size])
         loss = fluid.layers.softmax_with_cross_entropy(
             logits=projection, label=label, soft_label=False)
         loss = fluid.layers.reshape(loss, shape=[-1, self.num_steps])
         loss = fluid.layers.reduce_mean(loss, dim=[0])
         loss = fluid.layers.reduce_sum(loss)
-        loss.permissions = True
 
         return loss, last_hidden, last_cell
 
 
 class TestDygraphPtbRnn(unittest.TestCase):
-    def test_ptb_rnn_cpu_float32(self):
+    def test_ptb_rnn(self):
+        for is_sparse in [True, False]:
+            self.ptb_rnn_cpu_float32(is_sparse)
+
+    def ptb_rnn_cpu_float32(self, is_sparse):
         seed = 90
         hidden_size = 10
         vocab_size = 1000
@@ -223,31 +222,35 @@ class TestDygraphPtbRnn(unittest.TestCase):
         num_steps = 3
         init_scale = 0.1
         batch_size = 4
+        batch_num = 200
+        traced_layer = None
 
         with fluid.dygraph.guard():
-            fluid.default_startup_program().random_seed = seed
-            fluid.default_main_program().random_seed = seed
+            paddle.seed(seed)
+            paddle.framework.random._manual_program_seed(seed)
             # TODO: marsyang1993 Change seed to
             ptb_model = PtbModel(
-                "ptb_model",
                 hidden_size=hidden_size,
                 vocab_size=vocab_size,
                 num_layers=num_layers,
                 num_steps=num_steps,
-                init_scale=init_scale)
+                init_scale=init_scale,
+                is_sparse=is_sparse)
 
-            sgd = SGDOptimizer(learning_rate=1e-3)
+            sgd = SGDOptimizer(
+                learning_rate=1e-3, parameter_list=ptb_model.parameters())
             dy_param_updated = dict()
             dy_param_init = dict()
             dy_loss = None
             last_hidden = None
             last_cell = None
-            batch_num = 200
+
+            helper = DyGraphProgramDescTracerTestHelper(self)
+            program = None
 
             for i in range(batch_num):
                 x_data = np.arange(12).reshape(4, 3).astype('int64')
                 y_data = np.arange(1, 13).reshape(4, 3).astype('int64')
-                x_data = x_data.reshape((-1, num_steps, 1))
                 y_data = y_data.reshape((-1, 1))
                 init_hidden_data = np.zeros(
                     (num_layers, batch_size, hidden_size), dtype='float32')
@@ -257,32 +260,55 @@ class TestDygraphPtbRnn(unittest.TestCase):
                 y = to_variable(y_data)
                 init_hidden = to_variable(init_hidden_data)
                 init_cell = to_variable(init_cell_data)
-                dy_loss, last_hidden, last_cell = ptb_model(x, y, init_hidden,
-                                                            init_cell)
+                if i % 5 == 0:
+                    outs, traced_layer = TracedLayer.trace(
+                        ptb_model, [x, y, init_hidden, init_cell])
+                    outs_static = traced_layer([x, y, init_hidden, init_cell])
+                    helper.assertEachVar(outs, outs_static)
+
+                    if program is not None:
+                        self.assertTrue(
+                            is_equal_program(traced_layer.program, program))
+
+                    program = traced_layer.program
+
+                    traced_layer.save_inference_model(
+                        './infe_imperative_ptb_rnn', feed=list(range(4)))
+                else:
+                    outs = ptb_model(x, y, init_hidden, init_cell)
+
+                dy_loss, last_hidden, last_cell = outs
+
                 if i == 0:
                     for param in ptb_model.parameters():
-                        dy_param_init[param.name] = param._numpy()
-                dy_loss._backward()
+                        dy_param_init[param.name] = param.numpy()
+                dy_loss.backward()
                 sgd.minimize(dy_loss)
                 ptb_model.clear_gradients()
                 if i == batch_num - 1:
                     for param in ptb_model.parameters():
-                        dy_param_updated[param.name] = param._numpy()
+                        dy_param_updated[param.name] = param.numpy()
+
+            dy_loss_value = dy_loss.numpy()
+            dy_last_cell_value = last_cell.numpy()
+            dy_last_hidden_value = last_hidden.numpy()
 
         with new_program_scope():
-            fluid.default_startup_program().random_seed = seed
-            fluid.default_main_program().random_seed = seed
+            paddle.seed(seed)
+            paddle.framework.random._manual_program_seed(seed)
             ptb_model = PtbModel(
-                "ptb_model",
                 hidden_size=hidden_size,
                 vocab_size=vocab_size,
                 num_layers=num_layers,
                 num_steps=num_steps,
-                init_scale=init_scale)
+                init_scale=init_scale,
+                is_sparse=is_sparse)
 
-            exe = fluid.Executor(fluid.CPUPlace())
+            exe = fluid.Executor(fluid.CPUPlace(
+            ) if not core.is_compiled_with_cuda() else fluid.CUDAPlace(0))
             sgd = SGDOptimizer(learning_rate=1e-3)
-            x = fluid.layers.data(name="x", shape=[-1, 3, 1], dtype='int64')
+            x = fluid.layers.data(
+                name="x", shape=[-1, num_steps], dtype='int64')
             y = fluid.layers.data(name="y", shape=[-1, 1], dtype='float32')
             init_hidden = fluid.layers.data(
                 name="init_hidden", shape=[1], dtype='float32')
@@ -333,20 +359,15 @@ class TestDygraphPtbRnn(unittest.TestCase):
                         static_param_updated[static_param_name_list[k -
                                                                     3]] = out[k]
 
-        self.assertTrue(np.allclose(static_loss_value, dy_loss._numpy()))
-        self.assertTrue(np.allclose(static_last_cell_value, last_cell._numpy()))
+        self.assertTrue(np.array_equal(static_loss_value, dy_loss_value))
         self.assertTrue(
-            np.allclose(static_last_hidden_value, last_hidden._numpy()))
+            np.array_equal(static_last_cell_value, dy_last_cell_value))
+        self.assertTrue(
+            np.array_equal(static_last_hidden_value, dy_last_hidden_value))
         for key, value in six.iteritems(static_param_init):
-            # print("static_init name: {}, value {}".format(key, value))
-            # print("dy_init name: {}, value {}".format(key, dy_param_init[key]))
-            self.assertTrue(np.allclose(value, dy_param_init[key], atol=1e-5))
+            self.assertTrue(np.array_equal(value, dy_param_init[key]))
         for key, value in six.iteritems(static_param_updated):
-            # print("static name: {}, value {}".format(key, value))
-            # print("dy name: {}, value {}".format(key, dy_param_updated[key]))
-            self.assertTrue(
-                np.allclose(
-                    value, dy_param_updated[key], atol=1e-5))
+            self.assertTrue(np.array_equal(value, dy_param_updated[key]))
 
 
 if __name__ == '__main__':

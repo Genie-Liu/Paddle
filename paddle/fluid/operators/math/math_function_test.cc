@@ -208,6 +208,7 @@ void GemvTest(int m, int n, bool trans) {
       ASSERT_FLOAT_EQ(data_c[i], sum);
     }
   }
+  delete cpu_place;
 }
 
 TEST(math_function, gemv) {
@@ -224,7 +225,11 @@ TEST(math_funciton, set_constant) {
   auto* ctx = new paddle::platform::CPUDeviceContext();
   paddle::operators::math::set_constant(*ctx, &t, 10);
   for (int64_t i = 0; i < t.numel(); ++i) {
-    PADDLE_ENFORCE_EQ(10, t.data<int>()[i]);
+    PADDLE_ENFORCE_EQ(10, t.data<int>()[i],
+                      paddle::platform::errors::InvalidArgument(
+                          "Each value of input tensor should be 10, "
+                          "but received %d.",
+                          t.data<int>()[i]));
   }
   delete ctx;
 }
@@ -270,6 +275,7 @@ void GemmWarpTest(int m, int n, int k, T alpha, T beta) {
   for (int i = 0; i < mat_c_mkl.numel(); ++i) {
     EXPECT_FLOAT_EQ(CREF[i], CMKL[i]);
   }
+  delete cpu_place;
 }
 
 TEST(math_function, gemm_warp) {

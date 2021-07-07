@@ -1,4 +1,4 @@
-// Copyright (c) 2018 PaddlePaddle Authors. All Rights Reserved.
+// Copyright (c) 2019 PaddlePaddle Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,332 +11,257 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 #include "paddle/fluid/imperative/tracer.h"
-
-#include <memory>
+#include <map>
 #include <set>
-#include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include "paddle/fluid/framework/op_registry.h"
+#include "paddle/fluid/imperative/amp_auto_cast.h"
+#include "paddle/fluid/imperative/op_base.h"
+#include "paddle/fluid/platform/denormal.h"
+#include "paddle/fluid/platform/profiler.h"
+#include "paddle/fluid/string/string_helper.h"
 
-#include "paddle/fluid/framework/var_type_inference.h"
-#include "paddle/fluid/operators/math/math_function.h"
-#include "paddle/fluid/platform/device_context.h"
-#include "paddle/fluid/platform/enforce.h"
+DECLARE_bool(use_mkldnn);
+DECLARE_string(tracer_mkldnn_ops_on);
+DECLARE_string(tracer_mkldnn_ops_off);
 
 namespace paddle {
 namespace imperative {
 
-void CreateGradOp(const framework::OpDesc& op_desc,
-                  const std::unordered_set<std::string>& no_grad_set,
-                  const std::vector<framework::BlockDesc*>& grad_sub_block,
-                  std::vector<framework::OpDesc*>* grad_op_descs,
-                  std::unordered_map<std::string, std::string>* grad_to_var) {
-  PADDLE_ENFORCE(grad_op_descs->empty());
-  const framework::OpInfo& op_info =
-      framework::OpInfoMap::Instance().Get(op_desc.Type());
-  if (!op_info.grad_op_maker_) return;
+static std::shared_ptr<Tracer> g_current_tracer(nullptr);
 
-  std::vector<std::unique_ptr<framework::OpDesc>> descs =
-      op_info.GradOpMaker()(op_desc, no_grad_set, grad_to_var, grad_sub_block);
-  for (auto& desc : descs) {
-    grad_op_descs->emplace_back(desc.release());
-  }
+const std::shared_ptr<Tracer>& GetCurrentTracer() { return g_current_tracer; }
+
+void SetCurrentTracer(const std::shared_ptr<Tracer>& tracer) {
+  g_current_tracer = tracer;
+  VLOG(6) << "Set current tracer: " << g_current_tracer;
 }
 
-void InitGrad(VarBase* var, platform::DeviceContext* dev_ctx) {
-  PADDLE_ENFORCE_NOT_NULL(var, "Could not get valid var base");
-  PADDLE_ENFORCE_NOT_NULL(dev_ctx,
-                          "Could not get valid device from forward op");
-
-  if (var->grads_ == nullptr) {
-    auto& var_t = var->var_->Get<framework::LoDTensor>();
-    var->grads_ = new VarBase(var->GradName(), framework::proto::VarType::FP32,
-                              framework::vectorize(var_t.dims()),
-                              dev_ctx->GetPlace(), true, false);
-    auto grad_t = var->grads_->var_->GetMutable<framework::LoDTensor>();
-    operators::math::set_constant(*dev_ctx, grad_t, 0.0);
-  }
-}
-
-platform::Place GetExpectedPlace(platform::Place place, VarBasePtrMap inputs) {
-  platform::Place result = place;
-  for (auto it : inputs) {
-    for (VarBase* var : it.second) {
-      platform::Place tmp_place =
-          var->var_->Get<framework::LoDTensor>().place();
-      if (!platform::is_same_place(tmp_place, result)) {
-        PADDLE_THROW(
-            "Input variable should keep in the same place: %s, but get place: "
-            "%s of input %s instead",
-            result, tmp_place, it.first);
+void PassStopGradient(const NameVarBaseMap& outs, bool generate_grad) {
+  for (const auto& pair : outs) {
+    for (const auto& var : pair.second) {
+      // NOTE(zhiqiu): this happends when None output are passed from python
+      // side. For example, fake_quantize_dequantize_moving_average_abs_max may
+      // pass None OutAccum in eval mode.
+      // It can be refined by generate several different pybind interface for
+      // one operator with different function signature.
+      if (var == nullptr) {
+        VLOG(4) << pair.first << " is NULL";
+        continue;
       }
+      VLOG(6) << "Set output: " << var->Name() << "'s OverridedStopGradient as "
+              << generate_grad;
+      var->InnerSetOverridedStopGradient(generate_grad);
     }
   }
-
-  return result;
 }
 
-framework::VariableNameMap CreateInputVarNameMap(
-    const OpBase* op, const VarBasePtrMap& varbase_map) {
-  framework::VariableNameMap result;
+void IncreaseVarbaseReferenceCountUntilCopyComplete(
+    const std::shared_ptr<imperative::VarBase>& var,
+    const platform::Place& place) {
+  // Note(zhiqiu): Follow the logic of TensorCopy to determine the place that we
+  // need to add callback, see tensor_utils.cc:245
+  auto place_ = platform::is_gpu_place(place) ? place : var->Place();
 
-  auto& info_map = framework::OpInfoMap::Instance();
-  auto* op_info = info_map.GetNullable(op->Type());
-  if (op_info == nullptr || op_info->proto_ == nullptr) {
-    return result;
-  }
+  auto tracer = imperative::GetCurrentTracer();
+  auto gc = tracer->MutableGarbageCollectorIfNotExists(place_);
 
-  for (auto& in : op_info->Proto().inputs()) {
-    auto it = varbase_map.find(in.name());
-    if (it == varbase_map.end()) {
-      PADDLE_ENFORCE(in.dispensable());
-      result[in.name()] = {};
+  // Note(zhiqiu): This is an empty callback, the only way is to "reference"
+  // var, so it will not be destructed until the kernels launched at current
+  // stream of given place is finished.
+  auto callback = [var, place_]() {
+    VLOG(4) << "Run callback of var:" << var->Name() << " at place " << place_;
+  };
+
+  gc->DirectClearCallback(callback);
+}
+
+paddle::framework::GarbageCollector* Tracer::MutableGarbageCollectorIfNotExists(
+    const platform::Place& place) {
+  // if not exists, create a new GarbageCollector at given place
+  if (gcs_.count(place) == 0) {
+    std::unique_ptr<framework::GarbageCollector> gc;
+    if (platform::is_gpu_place(place)) {
+#if defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_HIP)
+      gc.reset(new framework::DefaultStreamGarbageCollector(
+          BOOST_GET_CONST(platform::CUDAPlace, place), 0));
+
+      VLOG(10) << "Created GarbageCollector at " << place;
+#else
+      PADDLE_THROW(platform::errors::PermissionDenied(
+          "Paddle can't use CUDA device since it's not compiled with CUDA,"
+          "Please recompile or reinstall Paddle with GPU support."));
+#endif
+    } else if (platform::is_cuda_pinned_place(place)) {
+#if defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_HIP)
+      gc.reset(new framework::CUDAPinnedGarbageCollector(
+          BOOST_GET_CONST(platform::CUDAPinnedPlace, place), 0));
+
+      VLOG(10) << "Created GarbageCollector at " << place;
+#else
+      PADDLE_THROW(platform::errors::PermissionDenied(
+          "Paddle can't use CUDAPinned device since it's not compiled with "
+          "CUDA,"
+          "Please recompile or reinstall Paddle with GPU support."));
+#endif
+    } else if (platform::is_xpu_place(place)) {
+#if defined(PADDLE_WITH_XPU)
+      gc.reset(new framework::XPUGarbageCollector(
+          BOOST_GET_CONST(platform::XPUPlace, place), 0));
+      VLOG(10) << "Created GarbageCollector at " << place;
+#else
+      PADDLE_THROW(platform::errors::PermissionDenied(
+          "Paddle can't use XPU device since it's not compiled with XPU,"
+          "Please recompile or reinstall Paddle with XPU support."));
+#endif
+    } else if (platform::is_cpu_place(place)) {
+      gc.reset(new framework::CPUGarbageCollector(
+          BOOST_GET_CONST(platform::CPUPlace, place), 0));
+      VLOG(10) << "Created GarbageCollector at " << place;
+    } else if (platform::is_npu_place(place)) {
+#if defined(PADDLE_WITH_ASCEND_CL)
+      // TODO(zhiqiu): fix bugs and enable NPUDefaultStreamGarbageCollector.
+      gc.reset(new framework::NPUUnsafeFastGarbageCollector(
+          BOOST_GET_CONST(platform::NPUPlace, place), 0));
+      VLOG(10) << "Created GarbageCollector at " << place;
+#else
+      PADDLE_THROW(platform::errors::PermissionDenied(
+          "Paddle can't use NPU device since it's not compiled with NPU,"
+          "Please recompile or reinstall Paddle with NPU support."));
+#endif
     } else {
-      auto var_vector = it->second;
-      std::vector<std::string> args;
-      args.reserve(var_vector.size());
-      for (VarBase* var_base : var_vector) {
-        args.emplace_back(var_base->Name());
-      }
-      result[in.name()] = args;
+      PADDLE_THROW(platform::errors::PreconditionNotMet(
+          "Unsupported place for garbage collection"));
     }
+    gcs_.emplace(place, std::move(gc));
   }
-  return result;
+
+  return gcs_.at(place).get();
 }
 
-framework::VariableNameMap CreateOutputVarNameMap(
-    const OpBase* op, const VarBasePtrMap& varbase_map) {
-  framework::VariableNameMap result;
-
-  auto& info_map = framework::OpInfoMap::Instance();
-  auto* op_info = info_map.GetNullable(op->Type());
-  if (op_info == nullptr || op_info->proto_ == nullptr) {
-    return result;
-  }
-
-  for (auto& out : op_info->Proto().outputs()) {
-    auto it = varbase_map.find(out.name());
-    if (it == varbase_map.end()) {
-      PADDLE_ENFORCE(out.dispensable());
-      result[out.name()] = {};
+void Tracer::TraceOp(const std::string& type, const NameVarBaseMap& ins,
+                     const NameVarBaseMap& outs, framework::AttributeMap attrs,
+                     const platform::Place& place, bool trace_backward,
+                     const std::map<std::string, std::string>& inplace_map) {
+  platform::RecordEvent op_type_record_event(type);
+  platform::ScopedFlushDenormal flush;
+  VLOG(1) << "Trace Op: " << type;
+  if (FLAGS_use_mkldnn) {
+    // if both lists are empty all ops are enabled (default for
+    // FLAGS_use_mkldnn=1)
+    // if ops_on list is not empty only ops from that list are enabled
+    if (!FLAGS_tracer_mkldnn_ops_on.empty()) {
+      auto is_on = FLAGS_tracer_mkldnn_ops_on.find(type) != std::string::npos;
+      attrs["use_mkldnn"] = is_on;
     } else {
-      auto var_vector = it->second;
-      std::vector<std::string> args;
-      args.reserve(var_vector.size());
-      for (VarBase* var_base : var_vector) {
-        args.emplace_back(var_base->Name());
-      }
-      result[out.name()] = args;
+      // if ops_on list is empty all ops are enabled except types from off_list
+      auto is_off = FLAGS_tracer_mkldnn_ops_off.find(type) != std::string::npos;
+      attrs["use_mkldnn"] = !is_off;
     }
   }
-  return result;
+  auto op = framework::OpRegistry::CreateOp(type, {}, {}, {}, false);
+  const auto& op_info = op->Info();
+  auto* attr_checker = op_info.Checker();
+  if (attr_checker) {
+    attr_checker->Check(&attrs, true, /*only_check_exist_value=*/true);
+  }
+
+  static paddle::framework::AttributeMap empty_attrs_map = {};
+  const paddle::framework::AttributeMap& default_attrs =
+      attr_checker == nullptr ? empty_attrs_map
+                              : attr_checker->GetDefaultAttrMap();
+
+  NameVarBaseMap new_ins = ins;
+  if (enable_autocast_) {
+    VLOG(5) << "Auto mixed precision run operator: " << type;
+    new_ins = AutoCastInputs(type, ins);
+  }
+
+  try {
+    if (platform::is_gpu_place(place)) {
+#if defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_HIP)
+      platform::SetDeviceId(BOOST_GET_CONST(platform::CUDAPlace, place).device);
+#else
+      PADDLE_THROW(platform::errors::PreconditionNotMet(
+          "PaddlePaddle should compile with GPU if use CUDAPlace."));
+#endif
+    } else if (platform::is_xpu_place(place)) {
+#ifdef PADDLE_WITH_XPU
+      platform::SetXPUDeviceId(
+          BOOST_GET_CONST(platform::XPUPlace, place).device);
+#else
+      PADDLE_THROW(platform::errors::PreconditionNotMet(
+          "PaddlePaddle should compile with XPU if use XPUPlace."));
+#endif
+    } else if (platform::is_npu_place(place)) {
+#ifdef PADDLE_WITH_ASCEND_CL
+      platform::SetNPUDeviceId(
+          BOOST_GET_CONST(platform::NPUPlace, place).device);
+#else
+      PADDLE_THROW(platform::errors::PreconditionNotMet(
+          "PaddlePaddle should compile with NPU if use NPUPlace."));
+#endif
+    }
+
+    OpBase::Run(*op, new_ins, outs, attrs, default_attrs, place);
+  } catch (platform::EnforceNotMet& exception) {
+    framework::AppendErrorOpHint(type, &exception);
+    throw std::move(exception);
+  } catch (std::exception& ex) {
+    PADDLE_THROW(platform::errors::Fatal(
+        "Operator %s raises an %s exception.\n"
+        "The exception content is\n:%s.",
+        type, platform::demangle(typeid(ex).name()), ex.what()));
+  } catch (...) {
+    // NOTE: this branch represents a very serious bug with
+    // low probability of occurrence, and we can't get its
+    // exception content here.
+    PADDLE_THROW(platform::errors::Fatal(
+        "Operator %s raises an unknown exception.", type));
+  }
+
+  if (enable_program_desc_tracing_) {
+    VLOG(5) << "Trace op " << type << " into ProgramDesc";
+    program_desc_tracer_->InsertOp(type, new_ins, outs, attrs);
+  }
+
+  if (ComputeRequiredGrad(new_ins, outs, trace_backward)) {
+    CreateGradOpNode(*op, new_ins, outs, attrs, default_attrs, place,
+                     inplace_map);
+  } else {
+    VLOG(3) << "No Grad to track for Op: " << type;
+  }
 }
 
-Tracer::Tracer(framework::BlockDesc* root_block) : root_block_(root_block) {}
-
-std::set<std::string> Tracer::Trace(OpBase* op, const VarBasePtrMap& inputs,
-                                    VarBasePtrMap* outputs,
-                                    framework::AttributeMap attrs_map,
-                                    const platform::Place expected_place,
-                                    const bool stop_gradient) {
-  framework::VariableValueMap invars_map;
-  framework::VariableValueMap outvars_map;
-
-  // Construct input_vars_map and output_vars_map
-  std::map<std::string, VarBase*> current_vars_map;
-  op->input_vars_ = inputs;
-  for (auto it : op->input_vars_) {
-    auto& invars = invars_map[it.first];
-    invars.reserve(it.second.size());
-    for (VarBase* inp : it.second) {
-      PADDLE_ENFORCE_NOT_NULL(inp->var_, "op %s input %s nullptr", op->Type(),
-                              inp->Name());
-
-      invars.emplace_back(inp->var_);
-      if (!stop_gradient) {
-        current_vars_map[inp->Name()] = inp;
-      }
-      VLOG(3) << "input var name: " << inp->Name()
-              << " inited: " << inp->var_->IsInitialized()
-              << " stop_grad: " << inp->IsStopGradient();
-    }
-    op->TrackPreOp(it.first, it.second);
-  }
-
-  op->output_vars_ = *outputs;
-  for (auto it : op->output_vars_) {
-    auto& outvars = outvars_map[it.first];
-    const std::vector<VarBase*>& outputs = it.second;
-    outvars.reserve(outputs.size());
-    for (size_t i = 0U; i < outputs.size(); ++i) {
-      VarBase* out = outputs[i];
-      outvars.emplace_back(out->var_);
-      out->TrackPreOp(op, it.first, i, stop_gradient);
-      if (!stop_gradient) {
-        current_vars_map[out->Name()] = out;
-      }
-
-      VLOG(3) << "input var name: " << out->Name()
-              << " inited: " << out->var_->IsInitialized()
-              << " stop_grad: " << out->IsStopGradient();
-    }
-  }
-
-  // Check attrs and create op
-  framework::VariableNameMap invars_name_map =
-      CreateInputVarNameMap(op, inputs);
-  framework::VariableNameMap outvars_name_map =
-      CreateOutputVarNameMap(op, *outputs);
-
-  auto& info = framework::OpInfoMap::Instance().Get(op->Type());
-  if (info.Checker() != nullptr) {
-    info.Checker()->Check(&attrs_map);
-  }
-
-  std::unique_ptr<framework::OperatorBase> op_base =
-      framework::OpRegistry::CreateOp(op->Type(), invars_name_map,
-                                      outvars_name_map, attrs_map);
-
-  if (info.infer_var_type_) {
-    RuntimeInferVarTypeContext infer_var_type_ctx(&inputs, outputs, &attrs_map);
-    info.infer_var_type_(&infer_var_type_ctx);
-  }
-
-  // TODO(minqiyang): Support infer var type in imperative mode
-  // Run forward op
-  VLOG(3) << "tracer running " << op->Type();
-  framework::RuntimeContext ctx(invars_map, outvars_map);
-
-  // TODO(panyx0718): Cache p.
-  framework::OperatorWithKernel* op_kernel =
-      dynamic_cast<framework::OperatorWithKernel*>(op_base.get());
-  PADDLE_ENFORCE_NOT_NULL(op_kernel, "only support op with kernel");
-
-  framework::Scope scope;
-  op->place_ = GetExpectedPlace(expected_place, inputs);
-  PreparedOp prepared_op = PreparedOp::Prepare(ctx, *op_kernel, op->place_);
-  prepared_op.op.RuntimeInferShape(scope, op->place_, ctx);
-  prepared_op.func(
-      framework::ExecutionContext(prepared_op.op, scope, *prepared_op.dev_ctx,
-                                  prepared_op.ctx, prepared_op.kernel_configs));
-
-  // construct backward op
-  std::set<std::string> vars_saved_for_backward;
-  if (!stop_gradient) {
-    VLOG(5) << "start construct backward op";
-
-    // construct grad op descs
-    op->attrs_ = attrs_map;
-    std::unique_ptr<framework::OpDesc> fwd_op_desc(new framework::OpDesc(
-        op->Type(), invars_name_map, outvars_name_map, attrs_map));
-    std::unique_ptr<std::unordered_map<std::string, std::string>> grad_to_var(
-        new std::unordered_map<std::string, std::string>());
-    // NOTE(minqiyang): We don't support control flow op in imperative now
-    // Add grad_block_ when we want to support it
-    CreateGradOp(*fwd_op_desc, {}, {}, &op->grad_op_descs_, grad_to_var.get());
-
-    VLOG(5) << "create grad op desc: " << op->grad_op_descs_[0]->Type();
-
-    const size_t grad_op_count = op->grad_op_descs_.size();
-
-    op->grad_input_vars_.resize(grad_op_count);
-    op->grad_output_vars_.resize(grad_op_count);
-
-    for (size_t i = 0; i < grad_op_count; ++i) {
-      framework::OpDesc* grad_op_desc = op->grad_op_descs_[i];
-      for (auto it : grad_op_desc->Inputs()) {
-        auto& grad_in_vars = op->grad_input_vars_[i][it.first];
-        grad_in_vars.reserve(it.second.size());
-        for (const std::string& grad_invar : it.second) {
-          auto var_it = grad_to_var->find(grad_invar);
-          if (var_it == grad_to_var->end()) {
-            auto fwd_var_it = current_vars_map.find(grad_invar);
-            PADDLE_ENFORCE(fwd_var_it != current_vars_map.end());
-            // Forward inputs or outputs.
-            grad_in_vars.emplace_back(fwd_var_it->second);
-          } else {
-            VarBase* var = current_vars_map[var_it->second];
-            InitGrad(var, prepared_op.GetDeviceContext());
-            // Douts.
-            grad_in_vars.emplace_back(var->grads_);
-          }
-
-          vars_saved_for_backward.insert(it.first);
-        }
-      }
-
-      for (auto it : grad_op_desc->Outputs()) {
-        auto& grad_out_vars = op->grad_output_vars_[i][it.first];
-        for (const std::string& grad_outvar : it.second) {
-          auto var_it = grad_to_var->find(grad_outvar);
-          PADDLE_ENFORCE(var_it != grad_to_var->end(),
-                         "Could not found the grad op output var, should this "
-                         "operator %s's stop gradient be True",
-                         op->Type());
-          VarBase* var = current_vars_map[var_it->second];
-          InitGrad(var, prepared_op.GetDeviceContext());
-          grad_out_vars.push_back(var->grads_);
-          VLOG(3) << "grads output var name: " << var->name_;
-        }
-      }
-    }
-  }
-
-  return vars_saved_for_backward;
+void Tracer::TraceOp(const std::string& type, const NameVarBaseMap& ins,
+                     const NameVarBaseMap& outs, framework::AttributeMap attrs,
+                     const std::map<std::string, std::string>& inplace_map) {
+  TraceOp(type, ins, outs, std::move(attrs), expected_place_, has_grad_,
+          inplace_map);
 }
 
-std::vector<VarBase*> Tracer::PyTrace(OpBase* op,
-                                      const std::vector<VarBase*>& inputs,
-                                      bool stop_gradient) {
-  VLOG(3) << "py_trace " << op->Type();
+void Tracer::SetExpectedPlace(platform::Place place) {
+  expected_place_ = place;
+}
 
-  op->input_vars_[PyLayer::kFwdInp] = inputs;
+bool Tracer::ComputeRequiredGrad(const NameVarBaseMap& ins,
+                                 const NameVarBaseMap& outs,
+                                 bool trace_backward) {
+  if (!trace_backward) return false;
 
-  std::vector<framework::Variable*> ret_vars =
-      PyLayer::Apply(op->forward_id_, inputs);
-
-  op->TrackPreOp(PyLayer::kFwdInp, inputs);
-
-  std::vector<VarBase*>& outputs = op->output_vars_[PyLayer::kFwdOut];
-  outputs.reserve(ret_vars.size());
-  for (size_t i = 0U; i != ret_vars.size(); ++i) {
-    framework::Variable* v = ret_vars[i];
-    VarBase* out = new VarBase(string::Sprintf("%s_out_%d", op->Type(), i), v,
-                               nullptr, stop_gradient);
-    outputs.emplace_back(out);
-    out->TrackPreOp(op, PyLayer::kFwdOut, i, stop_gradient);
-  }
-
-  if (!stop_gradient) {
-    VLOG(5) << "start construct backward op";
-    op->grad_input_vars_.resize(1);
-    op->grad_output_vars_.resize(1);
-    auto& grad_input_vars =
-        op->grad_input_vars_[0][framework::GradVarName(PyLayer::kFwdInp)];
-    auto& grad_output_vars =
-        op->grad_output_vars_[0][framework::GradVarName(PyLayer::kFwdOut)];
-
-    for (VarBase* inp : inputs) {
-      grad_input_vars.push_back(inp);
-    }
-    for (VarBase* out : outputs) {
-      grad_input_vars.push_back(out);
-    }
-
-    // TODO(minqiyang): Add GPU support for PyLayer, only support CPU now
-    platform::CPUPlace place;
-    for (VarBase* out : outputs) {
-      InitGrad(out, platform::DeviceContextPool::Instance().Get(place));
-      grad_input_vars.push_back(out->grads_);
-    }
-
-    for (VarBase* inp : inputs) {
-      InitGrad(inp, platform::DeviceContextPool::Instance().Get(place));
-      grad_output_vars.push_back(inp->grads_);
+  for (const auto& name_pair : ins) {
+    for (const auto& var_base : name_pair.second) {
+      if (!var_base->OverridedStopGradient()) {
+        VLOG(6) << "Find out input: " << var_base->Name()
+                << "'s GeneratedGrad is True";
+        PassStopGradient(outs, var_base->OverridedStopGradient());
+        return true;
+      }
     }
   }
-  return outputs;
+  return false;
 }
 
 }  // namespace imperative

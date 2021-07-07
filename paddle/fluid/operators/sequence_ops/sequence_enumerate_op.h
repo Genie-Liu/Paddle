@@ -29,17 +29,31 @@ class SequenceEnumerateKernel : public framework::OpKernel<T> {
     int win_size = context.Attr<int>("win_size");
     auto pad_value = static_cast<T>(context.Attr<int>("pad_value"));
 
+    PADDLE_ENFORCE_EQ(
+        in->lod().empty(), false,
+        platform::errors::InvalidArgument(
+            "Input(X) Tensor of SequenceEnumerateOp does not contain "
+            "LoD information."));
+
     auto in_dims = in->dims();
     auto lod0 = in->lod()[0];
     PADDLE_ENFORCE_EQ(
         static_cast<uint64_t>(in_dims[0]), lod0.back(),
-        "The actual input data's size mismatched with LoD information.");
+        platform::errors::InvalidArgument(
+            "The actual input data's size mismatched with LoD information."
+            "Received input data size is %d (actual) vs %d (loD information).",
+            static_cast<uint64_t>(in_dims[0]), lod0.back()));
     PADDLE_ENFORCE_EQ(
         in_dims.size(), 2UL,
-        "Input(X) of SequenceEnumerate operator's rank should be 2.");
+        platform::errors::InvalidArgument(
+            "Input(X) of SequenceEnumerate operator's rank should be 2."
+            "Received %d instead.",
+            in_dims.size()));
     PADDLE_ENFORCE_EQ(in_dims[1], 1,
-                      "Input(X) of SequenceEnumerate operator's 2nd "
-                      "dimension should be 1.");
+                      platform::errors::InvalidArgument(
+                          "Input(X) of SequenceEnumerate operator's 2nd "
+                          "dimension should be 1. Received %d instead.",
+                          in_dims[1]));
 
     // Generate enumerate sequence set
     auto in_data = in->data<T>();
@@ -47,8 +61,10 @@ class SequenceEnumerateKernel : public framework::OpKernel<T> {
     out->set_lod(in->lod());
     auto out_data = out->mutable_data<T>(context.GetPlace());
     for (size_t i = 0; i < lod0.size() - 1; ++i) {
+      if (lod0[i] == lod0[i + 1]) continue;
       int start = lod0[i];
       int end = lod0[i + 1];
+
       int copy_size = win_size < end - start + 1 ? win_size : end - start + 1;
       int mid = end + 1 - copy_size;
       int pad_num = win_size - copy_size;

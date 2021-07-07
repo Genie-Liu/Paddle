@@ -11,8 +11,8 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
-
 #include "paddle/fluid/operators/sample_logits_op.h"
+#include <memory>
 #include "paddle/fluid/operators/math/sample_prob.h"
 
 namespace paddle {
@@ -59,6 +59,10 @@ class SampleLogitsOpMaker : public framework::OpProtoAndCheckerMaker {
         "Probabilities",
         "(Tensor, default: Tensor<float>), A 2-D tensor with shape [N, NT + S]."
         "The probabilites of sampled positive and negtive labels.")
+        .AsIntermediate();
+    AddOutput("LogitsDim", "Store dim information of Logits for gradient op")
+        .AsIntermediate();
+    AddOutput("LabelsDim", "Store dim information of Logits for gradient op")
         .AsIntermediate();
     AddOutput("SampledLogits",
               "(Tensor, default: Tensor<float>), A 2-D tensor with shape"
@@ -108,41 +112,62 @@ class SampleLogitsOp : public framework::OperatorWithKernel {
   using framework::OperatorWithKernel::OperatorWithKernel;
 
   void InferShape(framework::InferShapeContext* ctx) const override {
-    PADDLE_ENFORCE(ctx->HasInput("Logits"),
-                   "Input(Logits) should be not null.");
-    PADDLE_ENFORCE(ctx->HasInput("Labels"),
-                   "Input(Labels) should be not null.");
+    OP_INOUT_CHECK(ctx->HasInput("Labels"), "Input", "Logits",
+                   "SampleLogitsOp");
+    OP_INOUT_CHECK(ctx->HasInput("Labels"), "Input", "Logits",
+                   "SampleLogitsOp");
 
-    PADDLE_ENFORCE(ctx->HasOutput("Samples"),
-                   "Output(Samples) should be not null.");
-    PADDLE_ENFORCE(ctx->HasOutput("Probabilities"),
-                   "Output(Probabilities) should be not null.");
-    PADDLE_ENFORCE(ctx->HasOutput("SampledLogits"),
-                   "Output(SampledLogits) should be not null.");
-    PADDLE_ENFORCE(ctx->HasOutput("SampledLabels"),
-                   "Output(SampledLabels) should be not null.");
+    OP_INOUT_CHECK(ctx->HasOutput("Samples"), "Output", "Samples",
+                   "SampleLogitsOp");
+    OP_INOUT_CHECK(ctx->HasOutput("Probabilities"), "Output", "Probabilities",
+                   "SampleLogitsOp");
+    OP_INOUT_CHECK(ctx->HasOutput("SampledLogits"), "Output", "SampledLogits",
+                   "SampleLogitsOp");
+    OP_INOUT_CHECK(ctx->HasOutput("SampledLabels"), "Output", "SampledLabels",
+                   "SampleLogitsOp");
+    OP_INOUT_CHECK(ctx->HasOutput("LogitsDim"), "Output", "LogitsDim",
+                   "SampleLogitsOp");
+    OP_INOUT_CHECK(ctx->HasOutput("LabelsDim"), "Output", "LabelsDim",
+                   "SampleLogitsOp");
 
     auto logits_dims = ctx->GetInputDim("Logits");
     auto labels_dims = ctx->GetInputDim("Labels");
 
-    PADDLE_ENFORCE_EQ(
-        logits_dims.size(), 2UL,
-        "The logits of softmax_with_cross_entropy should be a 2-D tensor.");
+    PADDLE_ENFORCE_EQ(logits_dims.size(), 2UL,
+                      platform::errors::InvalidArgument(
+                          "Input(Logits) of SampleLogitsOp should be 2D. "
+                          "But received shape = [%s] and dimension is %d.",
+                          logits_dims, logits_dims.size()));
     PADDLE_ENFORCE_EQ(labels_dims.size(), 2UL,
-                      "The labels should be a 2-D tensor.");
+                      platform::errors::InvalidArgument(
+                          "Input(Labels) of SampleLogitsOp should be 2D. "
+                          "But received shape = [%s] and dimension is %d.",
+                          labels_dims, labels_dims.size()));
 
     const int num_samples = ctx->Attrs().Get<int>("num_samples");
-    const int num_sampled_classes = labels_dims[1] + num_samples;
+    int num_sampled_classes = labels_dims[1] + num_samples;
+    if ((!ctx->IsRuntime()) && labels_dims[1] <= 0) {
+      num_sampled_classes = -1;
+    }
     ctx->SetOutputDim("Samples", {logits_dims[0], num_sampled_classes});
     ctx->SetOutputDim("Probabilities", {logits_dims[0], num_sampled_classes});
     ctx->SetOutputDim("SampledLogits", {logits_dims[0], num_sampled_classes});
     ctx->SetOutputDim("SampledLabels", {logits_dims[0], labels_dims[1]});
+
+    // append 0 to shape variable to avoid optimized by memory optimize pass
+    auto logits_dim_vec = framework::vectorize(logits_dims);
+    logits_dim_vec.push_back(0);
+    ctx->SetOutputDim("LogitsDim", framework::make_ddim(logits_dim_vec));
+
+    auto labels_dim_vec = framework::vectorize(labels_dims);
+    labels_dim_vec.push_back(0);
+    ctx->SetOutputDim("LabelsDim", framework::make_ddim(labels_dim_vec));
   }
 
  protected:
   framework::OpKernelType GetExpectedKernelType(
       const framework::ExecutionContext& ctx) const override {
-    auto data_type = framework::GetDataTypeOfVar(ctx.InputVar("Logits"));
+    auto data_type = OperatorWithKernel::IndicateVarDataType(ctx, "Logits");
     framework::OpKernelType kt =
         framework::OpKernelType(data_type, ctx.device_context());
     return kt;
@@ -155,35 +180,42 @@ class SampleLogitsOpGrad : public framework::OperatorWithKernel {
   using framework::OperatorWithKernel::OperatorWithKernel;
 
   void InferShape(framework::InferShapeContext* ctx) const override {
-    PADDLE_ENFORCE(ctx->HasInput("Logits"),
-                   "Input(Logits) should not be null.");
-    PADDLE_ENFORCE(ctx->HasInput("Labels"),
-                   "Input(Labels) should be not null.");
-    PADDLE_ENFORCE(ctx->HasInput("Samples"),
-                   "Input(Samples) should be not null.");
-    PADDLE_ENFORCE(ctx->HasInput("SampledLogits"),
-                   "Input(SampledLogits) should be not null.");
-    PADDLE_ENFORCE(ctx->HasInput(framework::GradVarName("SampledLogits")),
-                   "Input(SampledLogits@Grad) should not be null.");
-    PADDLE_ENFORCE(ctx->HasOutput(framework::GradVarName("Logits")),
-                   "Output(Logits@Grad) should be not null.");
+    OP_INOUT_CHECK(ctx->HasInput("LogitsDim"), "Input", "LogitsDim",
+                   "SampleLogitsOpGrad");
+    OP_INOUT_CHECK(ctx->HasInput("LabelsDim"), "Input", "LabelsDim",
+                   "SampleLogitsOpGrad");
+    OP_INOUT_CHECK(ctx->HasInput("Samples"), "Input", "SamplesabelsDim",
+                   "SampleLogitsOpGrad");
+    OP_INOUT_CHECK(ctx->HasInput(framework::GradVarName("SampledLogits")),
+                   "Input", "SampledLogits@GRAD", "SampleLogitsOpGrad");
+    OP_INOUT_CHECK(ctx->HasOutput(framework::GradVarName("Logits")), "Output",
+                   "Logits@GRAD", "SampleLogitsOpGrad");
 
-    auto logit_dims = ctx->GetInputDim("Logits");
-    auto label_dims = ctx->GetInputDim("Labels");
-    PADDLE_ENFORCE_EQ(label_dims.size(), 2UL,
-                      "The label should be a 2-D tensor.");
-    PADDLE_ENFORCE_EQ(logit_dims.size(), 2UL,
-                      "The logits should be a 2-D tensor.");
+    auto logits_dims = ctx->GetInputDim("LogitsDim");
+    logits_dims = framework::DDim(logits_dims.Get(), logits_dims.size() - 1);
+    auto labels_dims = ctx->GetInputDim("LabelsDim");
+    labels_dims = framework::DDim(labels_dims.Get(), labels_dims.size() - 1);
+    PADDLE_ENFORCE_EQ(
+        logits_dims.size(), 2UL,
+        platform::errors::InvalidArgument(
+            "Input(LogitsDim) of SampleLogitsOpGrad should be 2D. "
+            "But received shape = [%s] and dimension is %d.",
+            logits_dims, logits_dims.size()));
+    PADDLE_ENFORCE_EQ(
+        labels_dims.size(), 2UL,
+        platform::errors::InvalidArgument(
+            "Input(LabelsDim) of SampleLogitsOpGrad should be 2D. "
+            "But received shape = [%s] and dimension is %d.",
+            labels_dims, labels_dims.size()));
 
-    ctx->SetOutputDim(framework::GradVarName("Logits"),
-                      ctx->GetInputDim("Logits"));
+    ctx->SetOutputDim(framework::GradVarName("Logits"), logits_dims);
   }
 
  protected:
   framework::OpKernelType GetExpectedKernelType(
       const framework::ExecutionContext& ctx) const override {
-    auto data_type = framework::GetDataTypeOfVar(
-        ctx.InputVar(framework::GradVarName("SampledLogits")));
+    auto data_type = OperatorWithKernel::IndicateVarDataType(
+        ctx, framework::GradVarName("SampledLogits"));
     framework::OpKernelType kt =
         framework::OpKernelType(data_type, ctx.device_context());
     return kt;
@@ -191,23 +223,23 @@ class SampleLogitsOpGrad : public framework::OperatorWithKernel {
 };
 
 // UNDERSTAND: what's the rule for making a GradMaker TODO
-class SampleLogitsGradMaker : public framework::SingleGradOpDescMaker {
+
+template <typename T>
+class SampleLogitsGradMaker : public framework::SingleGradOpMaker<T> {
  public:
-  using framework::SingleGradOpDescMaker::SingleGradOpDescMaker;
+  using framework::SingleGradOpMaker<T>::SingleGradOpMaker;
 
  protected:
-  std::unique_ptr<framework::OpDesc> Apply() const override {
-    auto* grad_op = new framework::OpDesc();
+  void Apply(GradOpPtr<T> grad_op) const override {
     grad_op->SetType("sample_logits_grad");
-    grad_op->SetInput("Logits", Input("Logits"));
-    grad_op->SetInput("Labels", Input("Labels"));
-    grad_op->SetInput("Samples", Output("Samples"));
-    grad_op->SetInput("SampledLogits", Output("SampledLogits"));
+    grad_op->SetInput("LogitsDim", this->Output("LogitsDim"));
+    grad_op->SetInput("LabelsDim", this->Output("LabelsDim"));
+    grad_op->SetInput("Samples", this->Output("Samples"));
     grad_op->SetInput(framework::GradVarName("SampledLogits"),
-                      OutputGrad("SampledLogits"));
-    grad_op->SetOutput(framework::GradVarName("Logits"), InputGrad("Logits"));
-    grad_op->SetAttrMap(Attrs());
-    return std::unique_ptr<framework::OpDesc>(grad_op);
+                      this->OutputGrad("SampledLogits"));
+    grad_op->SetOutput(framework::GradVarName("Logits"),
+                       this->InputGrad("Logits"));
+    grad_op->SetAttrMap(this->Attrs());
   }
 };
 
@@ -217,7 +249,8 @@ class SampleLogitsGradMaker : public framework::SingleGradOpDescMaker {
 namespace ops = paddle::operators;
 
 REGISTER_OPERATOR(sample_logits, ops::SampleLogitsOp, ops::SampleLogitsOpMaker,
-                  ops::SampleLogitsGradMaker);
+                  ops::SampleLogitsGradMaker<paddle::framework::OpDesc>,
+                  ops::SampleLogitsGradMaker<paddle::imperative::OpBase>);
 REGISTER_OPERATOR(sample_logits_grad, ops::SampleLogitsOpGrad);
 REGISTER_OP_CPU_KERNEL(sample_logits, ops::SampleLogitsKernel<float>,
                        ops::SampleLogitsKernel<double>);

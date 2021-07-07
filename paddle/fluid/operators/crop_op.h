@@ -17,6 +17,7 @@ limitations under the License. */
 #include <vector>
 #include "paddle/fluid/framework/eigen.h"
 #include "paddle/fluid/framework/op_registry.h"
+#include "paddle/fluid/operators/eigen/eigen_function.h"
 #include "paddle/fluid/operators/strided_memcpy.h"
 
 namespace paddle {
@@ -31,14 +32,23 @@ static std::vector<int> GetOffsets(const framework::ExecutionContext& ctx) {
   std::vector<int> res;
   int rank = ctx.Input<Tensor>("X")->dims().size();
   if (ctx.HasInput("Offsets")) {
-    PADDLE_ENFORCE(ctx.Attr<std::vector<int>>("offsets").empty(),
-                   "Input 'Offsets' and attribute 'offsets' should not be used "
-                   "at the same time.");
+    PADDLE_ENFORCE_EQ(ctx.Attr<std::vector<int>>("offsets").empty(), true,
+                      platform::errors::InvalidArgument(
+                          "Input 'Offsets' and attribute 'offsets' "
+                          "should not be used at the same time for CropOp."));
     const auto* offsets_tensor = ctx.Input<Tensor>("Offsets");
-    PADDLE_ENFORCE_EQ(offsets_tensor->dims().size(), 1);
+    PADDLE_ENFORCE_EQ(offsets_tensor->dims().size(), 1,
+                      platform::errors::InvalidArgument(
+                          "The number of dimensions of input 'Offsets' for "
+                          "CropOp must be 1, but the value received is %d.",
+                          offsets_tensor->dims().size()));
     PADDLE_ENFORCE_EQ(
         rank, offsets_tensor->dims()[0],
-        "Offsets size should be equal to dimension size of input tensor.");
+        platform::errors::InvalidArgument("The number of elements (%d) for "
+                                          "input 'Offsets' must be equal to "
+                                          "the number of dimensions (%d) "
+                                          "of the input tensor.",
+                                          offsets_tensor->dims()[0], rank));
     const int* offsets_data;
     framework::Tensor cpu_tmp_tensor;
     if (platform::is_cpu_place(offsets_tensor->place())) {
@@ -53,7 +63,11 @@ static std::vector<int> GetOffsets(const framework::ExecutionContext& ctx) {
     res = ctx.Attr<std::vector<int>>("offsets");
     PADDLE_ENFORCE_EQ(
         rank, static_cast<int>(res.size()),
-        "Offsets size should be equal to dimension size of input tensor.");
+        platform::errors::InvalidArgument("The number of elements (%d) for "
+                                          "input 'Offsets' must be equal to "
+                                          "the number of dimensions (%d) "
+                                          "of the input tensor.",
+                                          res.size(), rank));
   }
   return res;
 }
@@ -76,15 +90,16 @@ void CropFunction(const framework::ExecutionContext& context) {
 
   auto x_tensor = EigenTensor<T, D>::From(*x);
   auto out_tensor = EigenTensor<T, D>::From(*out);
-  Eigen::array<int, D> e_offsets;
-  Eigen::array<int, D> e_shape;
+  Eigen::DSizes<Eigen::DenseIndex, D> e_offsets;
+  Eigen::DSizes<Eigen::DenseIndex, D> e_shape;
   for (size_t i = 0; i < D; ++i) {
     e_offsets[i] = offsets[i];
     e_shape[i] = out->dims()[i];
   }
   auto& place =
       *context.template device_context<DeviceContext>().eigen_device();
-  out_tensor.device(place) = x_tensor.slice(e_offsets, e_shape);
+  EigenSlice<std::decay_t<decltype(place)>, T, D>::Eval(
+      place, out_tensor, x_tensor, e_offsets, e_shape);
 }
 
 template <typename DeviceContext, typename T>
@@ -92,6 +107,18 @@ class CropKernel : public framework::OpKernel<T> {
  public:
   void Compute(const framework::ExecutionContext& context) const override {
     int rank = context.Input<Tensor>("X")->dims().size();
+    PADDLE_ENFORCE_GE(
+        rank, 1,
+        platform::errors::InvalidArgument(
+            "The number of dimensions of the Input(X) for CropOp must be "
+            "greater than or equal to 1, but the value received is %d.",
+            rank));
+    PADDLE_ENFORCE_LE(
+        rank, 6,
+        platform::errors::InvalidArgument(
+            "The number of dimensions of the Input(X) for CropOp must be "
+            "less than or equal to 6, but the value received is %d.",
+            rank));
     switch (rank) {
       case 1:
         CropFunction<DeviceContext, T, 1>(context);
@@ -111,9 +138,6 @@ class CropKernel : public framework::OpKernel<T> {
       case 6:
         CropFunction<DeviceContext, T, 6>(context);
         break;
-      default:
-        PADDLE_THROW(
-            "CropOp only support tensors with no more than 6 dimensions.");
     }
   }
 };
@@ -126,16 +150,17 @@ void CropGradFunction(const framework::ExecutionContext& context) {
     auto* d_out = context.Input<Tensor>(framework::GradVarName("Out"));
     d_x->mutable_data<T>(x->dims(), context.GetPlace());
     auto offsets = GetOffsets(context);
-    Eigen::array<std::pair<int, int>, D> paddings;
+    Eigen::array<std::pair<int64_t, int64_t>, D> paddings;
     for (size_t i = 0; i < D; ++i) {
       paddings[i].first = offsets[i];
       paddings[i].second = d_x->dims()[i] - d_out->dims()[i] - offsets[i];
     }
     auto d_x_tensor = EigenTensor<T, D>::From(*d_x);
     auto d_out_tensor = EigenTensor<T, D>::From(*d_out);
-    d_x_tensor.device(
-        *context.template device_context<DeviceContext>().eigen_device()) =
-        d_out_tensor.pad(paddings, 0);
+    auto& place =
+        *context.template device_context<DeviceContext>().eigen_device();
+    EigenPad<std::decay_t<decltype(place)>, T, D>::Eval(
+        place, d_x_tensor, d_out_tensor, paddings, static_cast<T>(0));
   }
 }
 
@@ -145,6 +170,18 @@ class CropGradKernel : public framework::OpKernel<T> {
   void Compute(const framework::ExecutionContext& context) const override {
     size_t rank =
         context.Input<Tensor>(framework::GradVarName("Out"))->dims().size();
+    PADDLE_ENFORCE_GE(
+        rank, 1, platform::errors::InvalidArgument(
+                     "The number of dimensions of the input 'Out@GRAD' for "
+                     "CropGrad must be greater than or equal "
+                     "to 1, but the value received is %d.",
+                     rank));
+    PADDLE_ENFORCE_LE(
+        rank, 6, platform::errors::InvalidArgument(
+                     "The number of dimensions of the input 'Out@GRAD' for "
+                     "CropGrad must be less than or equal "
+                     "to 6, but the value received is %d.",
+                     rank));
     switch (rank) {
       case 1:
         CropGradFunction<DeviceContext, T, 1>(context);
@@ -164,9 +201,6 @@ class CropGradKernel : public framework::OpKernel<T> {
       case 6:
         CropGradFunction<DeviceContext, T, 6>(context);
         break;
-      default:
-        PADDLE_THROW(
-            "CropOp only support tensors with no more than 6 dimensions.");
     }
   }
 };

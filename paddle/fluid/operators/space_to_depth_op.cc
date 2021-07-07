@@ -13,11 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include "paddle/fluid/operators/space_to_depth_op.h"
+
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "paddle/fluid/framework/no_need_buffer_vars_inference.h"
+
 namespace paddle {
 namespace operators {
+
+using Tensor = framework::Tensor;
 
 class SpaceToDepthOp : public framework::OperatorWithKernel {
  public:
@@ -25,28 +31,78 @@ class SpaceToDepthOp : public framework::OperatorWithKernel {
 
   void InferShape(framework::InferShapeContext* ctx) const override {
     PADDLE_ENFORCE(ctx->HasInput("X"),
-                   "Input(X) of SpaceToDepthOp should not be null.");
+                   platform::errors::InvalidArgument(
+                       "Input(X) of SpaceToDepthOp should not be null."));
     PADDLE_ENFORCE(ctx->HasOutput("Out"),
-                   "Output(Out) of SpaceToDepthOp should not be null.");
+                   platform::errors::InvalidArgument(
+                       "Output(Out) of SpaceToDepthOp should not be null."));
 
     auto x_dims = ctx->GetInputDim("X");
-    PADDLE_ENFORCE_EQ(x_dims.size(), 4, "input should be a 4D tensor");
+    PADDLE_ENFORCE_EQ(x_dims.size(), 4, platform::errors::InvalidArgument(
+                                            "input should be a 4D tensor"));
     auto blocksize = ctx->Attrs().Get<int64_t>("blocksize");
 
-    PADDLE_ENFORCE_GT(blocksize, 1, "The blocksize should be Greater than 1");
-    PADDLE_ENFORCE_GT(x_dims[1], 0, "input channel should be Greater than 0");
-    PADDLE_ENFORCE_GT(x_dims[2], 0, "input Height should be Greater than 0");
-    PADDLE_ENFORCE_GT(x_dims[3], 0, "input Width should be Greater than 0");
+    PADDLE_ENFORCE_GT(blocksize, 1,
+                      platform::errors::InvalidArgument(
+                          "The blocksize should be Greater than 1"));
+    if (ctx->IsRuntime()) {
+      PADDLE_ENFORCE_GT(x_dims[1], 0,
+                        platform::errors::InvalidArgument(
+                            "input channel should be Greater than 0"));
+      PADDLE_ENFORCE_GT(x_dims[2], 0,
+                        platform::errors::InvalidArgument(
+                            "input Height should be Greater than 0"));
+      PADDLE_ENFORCE_GT(x_dims[3], 0,
+                        platform::errors::InvalidArgument(
+                            "input Width should be Greater than 0"));
 
-    PADDLE_ENFORCE_EQ(x_dims[1] % (blocksize * blocksize), 0,
-                      "input channel should be divisible of the square of "
-                      "SpaceToDepthOp blocksize");
-    PADDLE_ENFORCE_EQ(x_dims[2] % (blocksize), 0,
-                      "input Height should be divisible of the square of "
-                      "SpaceToDepthOp blocksize");
-    PADDLE_ENFORCE_EQ(x_dims[3] % (blocksize), 0,
-                      "input Width should be divisible of the square of "
-                      "SpaceToDepthOp blocksize");
+      PADDLE_ENFORCE_EQ(
+          x_dims[1] % (blocksize * blocksize), 0,
+          platform::errors::InvalidArgument(
+              "input channel should be divisible of the square of "
+              "SpaceToDepthOp blocksize"));
+      PADDLE_ENFORCE_EQ(x_dims[2] % (blocksize), 0,
+                        platform::errors::InvalidArgument(
+                            "input Height should be divisible of the square of "
+                            "SpaceToDepthOp blocksize"));
+      PADDLE_ENFORCE_EQ(x_dims[3] % (blocksize), 0,
+                        platform::errors::InvalidArgument(
+                            "input Width should be divisible of the square of "
+                            "SpaceToDepthOp blocksize"));
+    } else {
+      if (x_dims[1] != -1) {
+        PADDLE_ENFORCE_GT(x_dims[1], 0,
+                          platform::errors::InvalidArgument(
+                              "input channel should be Greater than 0"));
+        PADDLE_ENFORCE_EQ(
+            x_dims[1] % (blocksize * blocksize), 0,
+            platform::errors::InvalidArgument(
+                "input channel should be divisible of the square of "
+                "SpaceToDepthOp blocksize"));
+      }
+      if (x_dims[2] != -1) {
+        PADDLE_ENFORCE_GT(x_dims[2], 0,
+                          platform::errors::InvalidArgument(
+                              "input Height should be Greater than 0"));
+        PADDLE_ENFORCE_EQ(
+            x_dims[2] % (blocksize), 0,
+            platform::errors::InvalidArgument(
+                "input Height should be divisible of the square of "
+                "SpaceToDepthOp blocksize"));
+      }
+
+      if (x_dims[3] != -1) {
+        PADDLE_ENFORCE_GT(x_dims[3], 0,
+                          platform::errors::InvalidArgument(
+                              "input Width should be Greater than 0"));
+
+        PADDLE_ENFORCE_EQ(
+            x_dims[3] % (blocksize), 0,
+            platform::errors::InvalidArgument(
+                "input Width should be divisible of the square of "
+                "SpaceToDepthOp blocksize"));
+      }
+    }
 
     VLOG(3) << "SpaceToDepthOp operator x.shape=" << x_dims
             << "Attribute blocksize" << blocksize << std::endl;
@@ -100,15 +156,45 @@ class SpaceToDepthOpMaker : public framework::OpProtoAndCheckerMaker {
   }
 };
 
+DECLARE_NO_NEED_BUFFER_VARS_INFERER(SpaceToDepthGradOpNoBufferVarsInferer, "X");
+
+template <typename T>
+class SpaceToDepthGradOpMaker : public framework::SingleGradOpMaker<T> {
+ public:
+  using framework::SingleGradOpMaker<T>::SingleGradOpMaker;
+
+ protected:
+  void Apply(GradOpPtr<T> op) const override {
+    op->SetType("space_to_depth_grad");
+
+    op->SetInput(framework::GradVarName("Out"), this->OutputGrad("Out"));
+    op->SetInput("X", this->Input("X"));
+
+    op->SetOutput(framework::GradVarName("X"), this->InputGrad("X"));
+
+    op->SetAttrMap(this->Attrs());
+  }
+};
+
 class SpaceToDepthGradOp : public framework::OperatorWithKernel {
  public:
   using framework::OperatorWithKernel::OperatorWithKernel;
 
   void InferShape(framework::InferShapeContext* ctx) const override {
-    PADDLE_ENFORCE(ctx->HasInput("X"), "Input(X) shouldn't be null.");
+    PADDLE_ENFORCE(ctx->HasInput("X"), platform::errors::InvalidArgument(
+                                           "Input(X) shouldn't be null."));
     PADDLE_ENFORCE(ctx->HasInput(framework::GradVarName("Out")),
-                   "Input(Out@GRAD) shouldn't be null.");
+                   platform::errors::InvalidArgument(
+                       "Input(Out@GRAD) shouldn't be null."));
     ctx->SetOutputDim(framework::GradVarName("X"), ctx->GetInputDim("X"));
+  }
+
+ protected:
+  framework::OpKernelType GetExpectedKernelType(
+      const framework::ExecutionContext& ctx) const override {
+    return framework::OpKernelType(OperatorWithKernel::IndicateVarDataType(
+                                       ctx, framework::GradVarName("Out")),
+                                   ctx.GetPlace());
   }
 };
 }  // namespace operators
@@ -117,15 +203,19 @@ class SpaceToDepthGradOp : public framework::OperatorWithKernel {
 namespace ops = paddle::operators;
 
 REGISTER_OPERATOR(space_to_depth, ops::SpaceToDepthOp, ops::SpaceToDepthOpMaker,
-                  paddle::framework::DefaultGradOpDescMaker<true>);
-REGISTER_OPERATOR(space_to_depth_grad, ops::SpaceToDepthGradOp);
+                  ops::SpaceToDepthGradOpMaker<paddle::framework::OpDesc>,
+                  ops::SpaceToDepthGradOpMaker<paddle::imperative::OpBase>);
+REGISTER_OPERATOR(space_to_depth_grad, ops::SpaceToDepthGradOp,
+                  ops::SpaceToDepthGradOpNoBufferVarsInferer);
 REGISTER_OP_CPU_KERNEL(
     space_to_depth,
     ops::SpaceToDepthKernel<paddle::platform::CPUDeviceContext, float>,
     ops::SpaceToDepthKernel<paddle::platform::CPUDeviceContext, double>,
+    ops::SpaceToDepthKernel<paddle::platform::CPUDeviceContext, int>,
     ops::SpaceToDepthKernel<paddle::platform::CPUDeviceContext, int64_t>);
 REGISTER_OP_CPU_KERNEL(
     space_to_depth_grad,
     ops::SpaceToDepthGradKernel<paddle::platform::CPUDeviceContext, float>,
     ops::SpaceToDepthGradKernel<paddle::platform::CPUDeviceContext, double>,
+    ops::SpaceToDepthGradKernel<paddle::platform::CPUDeviceContext, int>,
     ops::SpaceToDepthGradKernel<paddle::platform::CPUDeviceContext, int64_t>);

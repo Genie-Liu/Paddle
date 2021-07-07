@@ -12,7 +12,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -81,7 +80,7 @@ nvinfer1::IHostMemory* CreateNetwork() {
   nvinfer1::INetworkDefinition* network = builder->createNetwork();
   // Add the input
   auto input = network->addInput(kInputTensor, nvinfer1::DataType::kFLOAT,
-                                 nvinfer1::DimsCHW{1, 1, 1});
+                                 nvinfer1::Dims3{1, 1, 1});
   EXPECT_NE(input, nullptr);
   // Add the hidden layer.
   auto layer = network->addFullyConnected(*input, 1, weights.get(), bias.get());

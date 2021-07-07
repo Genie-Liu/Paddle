@@ -15,6 +15,7 @@
 #pragma once
 
 #include <type_traits>
+
 #include "paddle/fluid/operators/jit/kernel_base.h"
 
 namespace paddle {
@@ -26,7 +27,7 @@ using T = float;
 
 void VSigmoid(const T* x, T* y, int n);
 void VTanh(const T* x, T* y, int n);
-void Softmax(const T* x, T* y, int n, int bs);
+void Softmax(const T* x, T* y, int n, int bs, int remain);
 
 void LSTMCtHt(lstm_t* step, const lstm_attr_t* attr);
 void LSTMC1H1(lstm_t* step, const lstm_attr_t* attr);

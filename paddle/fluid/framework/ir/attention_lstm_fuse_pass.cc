@@ -13,16 +13,71 @@
 // limitations under the License.
 
 #include "paddle/fluid/framework/ir/attention_lstm_fuse_pass.h"
+
 #include <string>
-#include <unordered_set>
+
 #include "paddle/fluid/framework/ir/graph_pattern_detector.h"
 #include "paddle/fluid/framework/ir/graph_viz_pass.h"
-#include "paddle/fluid/framework/lod_tensor.h"
 
 namespace paddle {
 namespace framework {
 namespace ir {
 
+AttentionLSTMFusePass::AttentionLSTMFusePass() {
+  AddOpCompat(OpCompat("while"))
+      .AddInput("X")  // A set of variables, unconstrained
+      .End()
+      .AddInput("Condition")  // An scalar
+      .IsTensor()
+      .End()
+      .AddOutput("Out")  // A set of variables, unconstrained
+      .End()
+      .AddOutput("StepScopes")  // A vector of local scope, unconstrained
+      .End()
+      .AddAttr("sub_block")
+      .IsType<framework::BlockDesc*>()
+      .End();
+
+  AddOpCompat(OpCompat("fill_constant"))
+      .AddInput("ValueTensor")
+      .IsTensor()
+      .IsOptional()
+      .End()
+      .AddInput("ShapeTensor")
+      .IsTensor()
+      .IsOptional()
+      .End()
+      .AddInput("ShapeTensorList")  // vector<Tensor<int>>
+      .IsOptional()
+      .End()
+      .AddOutput("Out")
+      .IsTensor()
+      .End()
+      .AddAttr("dtype")
+      .IsNumGE(0)
+      .IsNumLE(25)
+      .End()
+      .AddAttr("shape")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("value")
+      .IsType<float>()
+      .End();
+
+  AddOpCompat(OpCompat("sequence_expand"))
+      .AddInput("X")
+      .IsTensor()
+      .End()
+      .AddInput("Y")
+      .IsTensor()
+      .End()
+      .AddOutput("Out")
+      .IsTensor()
+      .End()
+      .AddAttr("ref_level")
+      .IsNumGE(-1)
+      .End();
+}
 struct Param {
   std::string X = "concat_0.tmp_0";
   std::string C0 = "cell_init";
@@ -41,9 +96,9 @@ struct Param {
   std::string LSTMOUT = "at.lstmout.new";
 };
 
-void PrepareParameters(Graph* graph, const Param& param);
+void PrepareParameters(Graph* graph, const Param& param, ir::Node* lstm_op);
 
-void FindWhileOp(Graph* graph) {
+void AttentionLSTMFusePass::FindWhileOp(Graph* graph) const {
   GraphPatternDetector gpd;
   std::unordered_set<int> fused_external_ops(
       {35, 36, 37, 38, 43, 44, 49, 45, 46, 47, 41, 42, 53, 54, 48,
@@ -60,6 +115,10 @@ void FindWhileOp(Graph* graph) {
 
   auto handle = [&](const GraphPatternDetector::subgraph_t& subgraph,
                     Graph* g) {
+    if (!IsCompat(subgraph, g)) {
+      LOG(WARNING) << "Pass in op compat failed.";
+      return;
+    }
     auto* while_pat_node = gpd.pattern().RetrieveNode("while");
     auto* while_node = subgraph.at(while_pat_node);
     marked_nodes.insert(while_node);
@@ -98,7 +157,7 @@ void FindWhileOp(Graph* graph) {
   auto* hidden_init = graph->RetrieveNode(8);
 
   auto* lstm_op = graph->CreateOpNode(&op_desc);
-  PrepareParameters(graph, param);
+  PrepareParameters(graph, param, lstm_op);
 
   IR_NODE_LINK_TO(X, lstm_op);
   IR_NODE_LINK_TO(cell_init, lstm_op);
@@ -108,7 +167,9 @@ void FindWhileOp(Graph* graph) {
   GraphSafeRemoveNodes(graph, marked_nodes);
 }
 
-#define CHECK_P1(x) PADDLE_ENFORCE_NOT_NULL(x);
+#define CHECK_P1(x)        \
+  PADDLE_ENFORCE_NOT_NULL( \
+      x, platform::errors::NotFound("%s is a null pointer.", #x))
 #define CHECK_P2(x0, x1) \
   CHECK_P1(x0);          \
   CHECK_P1(x1);
@@ -133,25 +194,36 @@ void PrepareLSTMBias(const LoDTensor& B_forget, const LoDTensor& B_input,
                      const LoDTensor& B_output, const LoDTensor& B_cell,
                      LoDTensor* out);
 
-void PrepareParameters(Graph* graph, const Param& param) {
+void PrepareParameters(Graph* graph, const Param& param, ir::Node* lstm_op) {
   // Check parameters
-  PADDLE_ENFORCE(graph->Has(kParamScopeAttr));
-  auto* scope = graph->Get<Scope*>(kParamScopeAttr);
+  PADDLE_ENFORCE_EQ(graph->Has(kParamScopeAttr), true,
+                    platform::errors::InvalidArgument(
+                        "Graph have no attribute: kParamScopeAttr."));
+  auto& scope = graph->Get<Scope>(kParamScopeAttr);
 
   // Create new parameters.
-  scope->Var(param.LSTMWeight)->GetMutable<LoDTensor>();
-  scope->Var(param.LSTMBias)->GetMutable<LoDTensor>();
-  scope->Var(param.Hidden)->GetMutable<LoDTensor>();
-  scope->Var(param.Cell)->GetMutable<LoDTensor>();
-  scope->Var(param.AttentionedX)->GetMutable<LoDTensor>();
-  scope->Var(param.AttentionFCOut)->GetMutable<LoDTensor>();
-  scope->Var(param.LSTMX)->GetMutable<LoDTensor>();
-  scope->Var(param.LSTMOUT)->GetMutable<LoDTensor>();
+  // AddInput
+  scope.Var(param.LSTMWeight)->GetMutable<LoDTensor>();
+  scope.Var(param.LSTMBias)->GetMutable<LoDTensor>();
+// AddOutput
+#define IR_NODE(x)                                 \
+  VarDesc key_##x(param.x);                        \
+  key_##x.SetPersistable(false);                   \
+  auto* node_##x = graph->CreateVarNode(&key_##x); \
+  IR_NODE_LINK_TO(lstm_op, node_##x);
+
+  IR_NODE(Hidden);
+  IR_NODE(Cell);
+  IR_NODE(AttentionedX);
+  IR_NODE(AttentionFCOut);
+  IR_NODE(LSTMX);
+  IR_NODE(LSTMOUT);
+#undef IR_NODE
 
 #define GATE_W(name__)                                               \
-  auto* W_##name__##_w0 = scope->FindVar(#name__ ".w_0");            \
-  auto* W_##name__##_w1 = scope->FindVar(#name__ ".w_1");            \
-  auto* W_##name__##_b0 = scope->FindVar(#name__ ".b_0");            \
+  auto* W_##name__##_w0 = scope.FindVar(#name__ ".w_0");             \
+  auto* W_##name__##_w1 = scope.FindVar(#name__ ".w_1");             \
+  auto* W_##name__##_b0 = scope.FindVar(#name__ ".b_0");             \
   CHECK_P3(W_##name__##_w0, W_##name__##_w1, W_##name__##_b0);       \
   VLOG(4) << #name__ "_w0"                                           \
           << " shape: " << W_##name__##_w0->Get<LoDTensor>().dims(); \
@@ -169,26 +241,29 @@ void PrepareParameters(Graph* graph, const Param& param) {
   GATE_W(c);
 #undef GATE_W
 
-  auto* attention_fc_w = scope->FindVar("attention_fc.w_0");
-  auto* attention_fc_b = scope->FindVar("attention_fc.b_0");
-  auto* attention_output_w = scope->FindVar("attention_output.w_0");
-  auto* attention_output_b = scope->FindVar("attention_output.b_0");
+  auto* attention_fc_w = scope.FindVar("attention_fc.w_0");
+  auto* attention_fc_b = scope.FindVar("attention_fc.b_0");
+  auto* attention_output_w = scope.FindVar("attention_output.w_0");
+  auto* attention_output_b = scope.FindVar("attention_output.b_0");
   CHECK_P4(attention_fc_w, attention_fc_b, attention_output_w,
            attention_output_b);
 
-  auto* lstm_weight = scope->Var(param.LSTMWeight);
+  auto* lstm_weight = scope.Var(param.LSTMWeight);
   auto* lstm_weight_t = lstm_weight->GetMutable<LoDTensor>();
-  auto* lstm_bias = scope->Var(param.LSTMBias);
+  auto* lstm_bias = scope.Var(param.LSTMBias);
   auto* lstm_bias_t = lstm_bias->GetMutable<LoDTensor>();
 
   // reshape attention_bias
   auto* attention_bias_t =
-      scope->FindVar(param.AttentionBias)->GetMutable<LoDTensor>();
-  PADDLE_ENFORCE_EQ(attention_bias_t->dims().size(), 1);
+      scope.FindVar(param.AttentionBias)->GetMutable<LoDTensor>();
+  PADDLE_ENFORCE_EQ(attention_bias_t->dims().size(), 1,
+                    platform::errors::InvalidArgument(
+                        "Tensor attention bias dimension size(%d) must be 1.",
+                        attention_bias_t->dims().size()));
   attention_bias_t->Resize(make_ddim({1, attention_bias_t->dims()[0]}));
 
   auto* attention_scalar_bias_t =
-      scope->FindVar(param.AttentionScalarBias)->GetMutable<LoDTensor>();
+      scope.FindVar(param.AttentionScalarBias)->GetMutable<LoDTensor>();
   attention_scalar_bias_t->Resize(
       make_ddim({1, attention_scalar_bias_t->dims()[0]}));
 
@@ -243,7 +318,10 @@ void PrepareLSTMBias(const LoDTensor& B_forget, const LoDTensor& B_input,
       B_forget.data<float>(), B_input.data<float>(), B_output.data<float>(),
       B_cell.data<float>()};
 
-  PADDLE_ENFORCE_EQ(B_forget.dims().size(), 1);
+  PADDLE_ENFORCE_EQ(B_forget.dims().size(), 1,
+                    platform::errors::InvalidArgument(
+                        "Tensor B forget dimension size(%d) must be 1.",
+                        B_forget.dims().size()));
   int D = B_forget.dims()[0];
   out->Resize(make_ddim({1, 4 * D}));
   auto* out_data = out->mutable_data<float>(platform::CPUPlace());

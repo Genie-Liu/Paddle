@@ -16,7 +16,7 @@ from __future__ import print_function
 
 import copy
 import six
-from ..framework import Parameter, _in_dygraph_mode
+from ..framework import Parameter, in_dygraph_mode, _global_flags
 from ..param_attr import ParamAttr
 from .. import core
 from six.moves import zip
@@ -65,7 +65,7 @@ class LayerObjectHelper(LayerHelperBase):
     def _input(self, inputs_in):
         inputs = self._multiple_input(inputs_in)
         if len(inputs) != 1:
-            raise "{0} layer only takes one input".format(self.layer_type)
+            raise "{0} layer only takes one input in".format(self.layer_type)
         return inputs[0]
 
     def _multiple_param_attr(self, length, param_attr_in=None):
@@ -74,7 +74,8 @@ class LayerObjectHelper(LayerHelperBase):
             param_attr = [param_attr]
 
         if len(param_attr) != 1 and len(param_attr) != length:
-            raise ValueError("parameter number mismatch")
+            raise ValueError("parameter number mismatch in {}".format(
+                self.name))
         elif len(param_attr) == 1 and length != 1:
             tmp = [None] * length
             for i in six.moves.range(length):
@@ -91,6 +92,10 @@ class LayerObjectHelper(LayerHelperBase):
 
         Returns input, param_attr
         """
+        param_attr_in = ParamAttr._to_attr(param_attr_in)
+        if isinstance(param_attr_in, bool):
+            raise ValueError('Param_attr should not be False in {}'.format(
+                self.name))
         inputs = inputs_in if (inputs_in is not None) else []
         inputs = self._multiple_input(inputs)
         param_attrs = self._multiple_param_attr(len(inputs), param_attr_in)
@@ -112,8 +117,8 @@ class LayerObjectHelper(LayerHelperBase):
             if dtype is None:
                 dtype = each.dtype
             elif dtype != each.dtype:
-                raise ValueError("Data Type mismatch: %d to %d" %
-                                 (dtype, each.dtype))
+                raise ValueError("Data Type mismatch: %d to %d in %s" %
+                                 (dtype, each.dtype, self.name))
         return dtype
 
     def get_parameter(self, name):
@@ -126,54 +131,18 @@ class LayerObjectHelper(LayerHelperBase):
         """
         param = self.main_program.global_block().var(name)
         if not isinstance(param, Parameter):
-            raise ValueError("no Parameter name %s found" % name)
+            raise ValueError("no Parameter name %s found in %s" %
+                             (name, self.name))
         return param
 
-    def append_bias_op(self,
-                       input_var,
-                       dim_start=1,
-                       dim_end=None,
-                       bias_attr=None):
-        """Append bias operator and return its output. If the user does not set bias_attr, append_bias_op will return input_var
-
-            Args:
-                input_var: the input variable. The len(input_var.shape) is
-                larger or equal than 2.
-                dim_start:
-                dim_end: the shape of the bias will be
-                bias_attr: the bias_attr of it
-
-        Return the Variable of after append bias op
-        """
-        size = list(input_var.shape[dim_start:dim_end])
-        bias_attr = bias_attr
-        if not bias_attr:
-            return input_var
-
-        b = self.create_parameter(
-            attr=bias_attr, shape=size, dtype=input_var.dtype, is_bias=True)
-        tmp = self.create_variable_for_type_inference(dtype=input_var.dtype)
-        self.append_op(
-            type='elementwise_add',
-            inputs={'X': [input_var],
-                    'Y': [b]},
-            outputs={'Out': [tmp]},
-            attrs={'axis': dim_start})
-        return tmp
-
     # TODO: this should not be called anymore after all activation func move to Layers
-    def append_activation(self,
-                          input_var,
-                          act=None,
-                          use_cudnn=None,
-                          use_mkl_dnn=None):
+    def append_activation(self, input_var, act=None, use_cudnn=None):
         """Append activation
 
             Args:
                 input_var: the input variable. The len(input_var.shape) is
                 larger or equal than 2.
                 act: activation type
-                use_mkl_dnn: if use mkldnn
                 use_cudnn: if use cudnn
 
         Return the Variable of after append activation
@@ -184,12 +153,14 @@ class LayerObjectHelper(LayerHelperBase):
         if isinstance(act, six.string_types):
             act = {'type': act}
         else:
-            raise TypeError(str(act) + " should be unicode or str")
+            raise TypeError(
+                str(act) + " should be unicode or str in %s ", self.name)
 
         if (use_cudnn is not None) and use_cudnn:
             act['use_cudnn'] = use_cudnn
-        if (use_mkl_dnn is not None) and use_mkl_dnn:
-            act['use_mkldnn'] = use_mkl_dnn
+        use_mkldnn = _global_flags()["FLAGS_use_mkldnn"]
+        if (use_mkldnn is not None) and use_mkldnn:
+            act['use_mkldnn'] = use_mkldnn
         act_type = act.pop('type')
 
         tmp = self.create_variable_for_type_inference(dtype=input_var.dtype)
@@ -211,5 +182,6 @@ class LayerObjectHelper(LayerHelperBase):
         """
         param = param
         if not isinstance(param, cls):
-            raise TypeError("The input {0} parameter of method {1} must be {2}",
-                            param, self.layer_type, cls.__name__)
+            raise TypeError(
+                "The input {0} parameter of method {1} must be {2}, in layer {3}",
+                param, self.layer_type, cls.__name__, self.name)

@@ -14,6 +14,10 @@ limitations under the License. */
 
 #pragma once
 #include <algorithm>
+#include <array>
+#include <numeric>
+#include <string>
+#include "paddle/fluid/framework/data_layout.h"
 #include "paddle/fluid/framework/eigen.h"
 #include "paddle/fluid/framework/op_registry.h"
 #include "paddle/fluid/operators/elementwise/elementwise_op_function.h"
@@ -31,6 +35,9 @@ template <typename DeviceContext, typename T>
 class GroupNormKernel : public framework::OpKernel<T> {
  public:
   void Compute(const framework::ExecutionContext& ctx) const override {
+    const std::string data_layout_str = ctx.Attr<std::string>("data_layout");
+    const DataLayout data_layout =
+        framework::StringToDataLayout(data_layout_str);
     const float epsilon = ctx.Attr<float>("epsilon");
     auto* scale = ctx.Input<Tensor>("Scale");
     auto* bias = ctx.Input<Tensor>("Bias");
@@ -42,7 +49,10 @@ class GroupNormKernel : public framework::OpKernel<T> {
     const auto groups = ctx.Attr<int>("groups");
 
     const auto x_dims = x->dims();
-    const int group_size = (x_dims[1] - 1) / groups + 1;
+    const int C =
+        (data_layout == DataLayout::kNCHW ? x_dims[1]
+                                          : x_dims[x_dims.size() - 1]);
+    const int group_size = (C - 1) / groups + 1;
 
     y->mutable_data<T>(ctx.GetPlace());
     mean->mutable_data<T>(ctx.GetPlace());
@@ -58,36 +68,140 @@ class GroupNormKernel : public framework::OpKernel<T> {
     const T* bias_data = nullptr;
     if (bias) bias_data = bias->data<T>();
 
-    int imsize = x_dims[2] * x_dims[3];
+    int imsize = (data_layout == DataLayout::kNCHW ? x_dims[2] * x_dims[3]
+                                                   : x_dims[1] * x_dims[2]);
+
     auto* iter_x_data = x_data;
     auto* iter_y_data = y_data;
-    for (int bid = 0; bid < x_dims[0]; bid++)
+    for (int bid = 0; bid < x_dims[0]; bid++) {
       for (int gid = 0; gid < groups; gid++) {
+        const int64_t M = 8;
+        std::array<T, M> x_mean_arr;
+        std::array<T, M> x_var_arr;
+        std::fill(x_mean_arr.begin(), x_mean_arr.end(), T(0));
+        std::fill(x_var_arr.begin(), x_var_arr.end(), T(0));
         T x_mean = 0, x_var = 0;
-        int number = std::min(group_size,
-                              static_cast<int>(x_dims[1] - gid * group_size));
-        auto* tmp = iter_x_data;
-        for (int cid = 0; cid < number; cid++) {
-          for (int imid = 0; imid < imsize; imid++, iter_x_data++) {
-            x_mean += iter_x_data[0];
-            x_var += iter_x_data[0] * iter_x_data[0];
+        int number =
+            std::min(group_size, static_cast<int>(C - gid * group_size));
+        auto* tmp_x = iter_x_data;
+        auto* x_src_data = iter_x_data;
+        auto* tmp_y = iter_y_data;
+        auto* y_src_data = iter_y_data;
+
+        if (data_layout == DataLayout::kNCHW) {
+          for (int cid = 0; cid < number; cid++) {
+            int imid;
+            for (imid = 0; imid < imsize - (imsize % M);
+                 imid += M, iter_x_data += M) {
+              // TODO(gaoxiang) ：Because AVX/AVX2/AVX512 can not directly used
+              // in template class/function, before we complete high
+              // performance cpu vector extension, temporarily unrolling
+              // loop to get high precision and performance
+              x_mean_arr[0] += iter_x_data[0];
+              x_var_arr[0] += iter_x_data[0] * iter_x_data[0];
+              x_mean_arr[1] += iter_x_data[1];
+              x_var_arr[1] += iter_x_data[1] * iter_x_data[1];
+              x_mean_arr[2] += iter_x_data[2];
+              x_var_arr[2] += iter_x_data[2] * iter_x_data[2];
+              x_mean_arr[3] += iter_x_data[3];
+              x_var_arr[3] += iter_x_data[3] * iter_x_data[3];
+              x_mean_arr[4] += iter_x_data[4];
+              x_var_arr[4] += iter_x_data[4] * iter_x_data[4];
+              x_mean_arr[5] += iter_x_data[5];
+              x_var_arr[5] += iter_x_data[5] * iter_x_data[5];
+              x_mean_arr[6] += iter_x_data[6];
+              x_var_arr[6] += iter_x_data[6] * iter_x_data[6];
+              x_mean_arr[7] += iter_x_data[7];
+              x_var_arr[7] += iter_x_data[7] * iter_x_data[7];
+            }
+            x_mean =
+                std::accumulate(x_mean_arr.cbegin(), x_mean_arr.cend(), x_mean);
+            x_var =
+                std::accumulate(x_var_arr.cbegin(), x_var_arr.cend(), x_var);
+            std::fill(x_mean_arr.begin(), x_mean_arr.end(), T(0));
+            std::fill(x_var_arr.begin(), x_var_arr.end(), T(0));
+            for (; imid < imsize; imid++, iter_x_data++) {
+              x_mean += iter_x_data[0];
+              x_var += iter_x_data[0] * iter_x_data[0];
+            }
           }
+        } else {
+          for (int cid = 0; cid < number; cid++) {
+            iter_x_data = tmp_x + cid;
+            int imid;
+            for (imid = 0; imid < imsize - (imsize % M);
+                 imid += M, iter_x_data += M * C) {
+              // TODO(gaoxiang) ：Because AVX/AVX2/AVX512 can not directly used
+              // in template class/function, before we complete high
+              // performance cpu vector extension, temporarily unrolling
+              // loop to get high precision and performance
+              x_mean_arr[0] += iter_x_data[0 * C];
+              x_var_arr[0] += iter_x_data[0 * C] * iter_x_data[0 * C];
+              x_mean_arr[1] += iter_x_data[1 * C];
+              x_var_arr[1] += iter_x_data[1 * C] * iter_x_data[1 * C];
+              x_mean_arr[2] += iter_x_data[2 * C];
+              x_var_arr[2] += iter_x_data[2 * C] * iter_x_data[2 * C];
+              x_mean_arr[3] += iter_x_data[3 * C];
+              x_var_arr[3] += iter_x_data[3 * C] * iter_x_data[3 * C];
+              x_mean_arr[4] += iter_x_data[4 * C];
+              x_var_arr[4] += iter_x_data[4 * C] * iter_x_data[4 * C];
+              x_mean_arr[5] += iter_x_data[5 * C];
+              x_var_arr[5] += iter_x_data[5 * C] * iter_x_data[5 * C];
+              x_mean_arr[6] += iter_x_data[6 * C];
+              x_var_arr[6] += iter_x_data[6 * C] * iter_x_data[6 * C];
+              x_mean_arr[7] += iter_x_data[7 * C];
+              x_var_arr[7] += iter_x_data[7 * C] * iter_x_data[7 * C];
+            }
+            x_mean =
+                std::accumulate(x_mean_arr.cbegin(), x_mean_arr.cend(), x_mean);
+            x_var =
+                std::accumulate(x_var_arr.cbegin(), x_var_arr.cend(), x_var);
+            std::fill(x_mean_arr.begin(), x_mean_arr.end(), T(0));
+            std::fill(x_var_arr.begin(), x_var_arr.end(), T(0));
+            for (; imid < imsize; imid++, iter_x_data += C) {
+              x_mean += iter_x_data[0];
+              x_var += iter_x_data[0] * iter_x_data[0];
+            }
+          }
+          iter_x_data = tmp_x + group_size;
         }
+
         x_mean /= number * imsize;
         x_var /= number * imsize;
-        x_var = x_var - x_mean * x_mean;
-        T var_inv = 1.0 / sqrt(x_var + epsilon);
+        x_var = std::max(x_var - x_mean * x_mean, T(0));
+        T var_inv = T(1) / std::sqrt(x_var + epsilon);
         mean_data[bid * groups + gid] = x_mean;
         var_data[bid * groups + gid] = x_var;
-        for (int cid = 0; cid < number; cid++) {
-          for (int imid = 0; imid < imsize; imid++, tmp++, iter_y_data++) {
-            T val = (tmp[0] - x_mean) * var_inv;
-            if (scale_data) val *= scale_data[gid * group_size + cid];
-            if (bias_data) val += bias_data[gid * group_size + cid];
-            iter_y_data[0] = val;
+
+        if (data_layout == DataLayout::kNCHW) {
+          for (int cid = 0; cid < number; cid++) {
+            for (int imid = 0; imid < imsize; imid++, tmp_x++, iter_y_data++) {
+              T val = (tmp_x[0] - x_mean) * var_inv;
+              if (scale_data) val *= scale_data[gid * group_size + cid];
+              if (bias_data) val += bias_data[gid * group_size + cid];
+              iter_y_data[0] = val;
+            }
           }
+        } else {
+          for (int cid = 0; cid < number; cid++) {
+            tmp_x = x_src_data + cid;
+            iter_y_data = y_src_data + cid;
+            for (int imid = 0; imid < imsize;
+                 imid++, tmp_x += C, iter_y_data += C) {
+              T val = (tmp_x[0] - x_mean) * var_inv;
+              if (scale_data) val *= scale_data[gid * group_size + cid];
+              if (bias_data) val += bias_data[gid * group_size + cid];
+              iter_y_data[0] = val;
+            }
+          }
+          iter_y_data = tmp_y + group_size;
         }
       }
+      if (data_layout == DataLayout::kNHWC) {
+        iter_x_data = x_data + (bid + 1) * C * imsize;
+        iter_y_data = y_data + (bid + 1) * C * imsize;
+      }
+    }
   }
 };
 
@@ -95,6 +209,9 @@ template <typename DeviceContext, typename T>
 class GroupNormGradKernel : public framework::OpKernel<T> {
  public:
   void Compute(const framework::ExecutionContext& ctx) const override {
+    const std::string data_layout_str = ctx.Attr<std::string>("data_layout");
+    const DataLayout data_layout =
+        framework::StringToDataLayout(data_layout_str);
     const float epsilon = ctx.Attr<float>("epsilon");
     auto* x = ctx.Input<Tensor>("Y");
     auto* var = ctx.Input<Tensor>("Variance");
@@ -109,7 +226,10 @@ class GroupNormGradKernel : public framework::OpKernel<T> {
     auto* d_bias = ctx.Output<Tensor>(framework::GradVarName("Bias"));
 
     const auto& x_dims = x->dims();
-    const int group_size = (x_dims[1] - 1) / groups + 1;
+    const int C =
+        (data_layout == DataLayout::kNCHW ? x_dims[1]
+                                          : x_dims[x_dims.size() - 1]);
+    const int group_size = (C - 1) / groups + 1;
 
     d_x->mutable_data<T>(ctx.GetPlace());
     math::SetConstant<DeviceContext, T> set_zero;
@@ -137,54 +257,116 @@ class GroupNormGradKernel : public framework::OpKernel<T> {
     const T* bias_data = nullptr;
     if (bias) bias_data = bias->data<T>();
 
-    int imsize = x_dims[2] * x_dims[3];
+    int imsize = (data_layout == DataLayout::kNCHW ? x_dims[2] * x_dims[3]
+                                                   : x_dims[1] * x_dims[2]);
     auto* iter_x_data = x_data;
     auto* iter_d_x_data = d_x_data;
     auto* iter_y_data = y_data;
-    for (int bid = 0; bid < x_dims[0]; bid++)
+    for (int bid = 0; bid < x_dims[0]; bid++) {
       for (int gid = 0; gid < groups; gid++) {
         T x_var = var_data[bid * groups + gid];
         T var_inv = 1.0 / sqrt(x_var + epsilon);
-        int number = std::min(group_size,
-                              static_cast<int>(x_dims[1] - gid * group_size));
+        int number =
+            std::min(group_size, static_cast<int>(C - gid * group_size));
         T number_inv = 1.0 / (number * imsize);
-        auto* iter_x_data2 = iter_x_data;
-        auto* iter_y_data2 = iter_y_data;
+        auto* tmp_x = iter_x_data;
+        auto* tmp_y = iter_y_data;
+        auto* tmp_d_x = iter_d_x_data;
+        auto* x_src_data = iter_x_data;
+        auto* y_src_data = iter_y_data;
+        auto* iter_x_data_backup = iter_x_data;
+        auto* iter_y_data_backup = iter_y_data;
+        auto* iter_d_x_data_backup = iter_d_x_data;
         T dp_scale = 0, dp_bias = 0;
-        for (int cid = 0; cid < number; cid++) {
-          for (int imid = 0; imid < imsize;
-               imid++, iter_x_data++, iter_y_data++) {
-            T val = iter_x_data[0];
-            if (bias_data) val -= bias_data[gid * group_size + cid];
-            T dval = iter_y_data[0];
-            dp_scale += val * dval;
-            dp_bias += dval * scale_data[gid * group_size + cid];
 
-            if (scale_data && scale_data[gid * group_size + cid] != 0)
-              val /= scale_data[gid * group_size + cid];
-            if (d_bias_data) d_bias_data[gid * group_size + cid] += dval;
-            if (d_scale_data)
-              d_scale_data[gid * group_size + cid] += val * dval;
-          }
-        }
+        if (data_layout == DataLayout::kNCHW) {
+          for (int cid = 0; cid < number; cid++) {
+            for (int imid = 0; imid < imsize;
+                 imid++, iter_x_data++, iter_y_data++) {
+              T val = iter_x_data[0];
+              if (bias_data) val -= bias_data[gid * group_size + cid];
+              T dval = iter_y_data[0];
+              dp_scale += val * dval;
+              if (scale_data)
+                dp_bias += dval * scale_data[gid * group_size + cid];
 
-        for (int cid = 0; cid < number; cid++) {
-          for (int imid = 0; imid < imsize;
-               imid++, iter_d_x_data++, iter_x_data2++, iter_y_data2++) {
-            T v_y = iter_x_data2[0];
-            T dly = iter_y_data2[0];
-            T dss = dp_scale;
-            T dbs = dp_bias;
-            T v_scale = scale_data[gid * group_size + cid];
-            T v_bias = bias_data[gid * group_size + cid];
-            v_y -= v_bias;
-            if (v_scale != 0) v_y /= v_scale;
-            iter_d_x_data[0] =
-                (dly * v_scale - number_inv * dss * v_y - number_inv * dbs) *
-                var_inv;
+              if (scale_data && scale_data[gid * group_size + cid] != 0)
+                val /= scale_data[gid * group_size + cid];
+              if (d_bias_data) d_bias_data[gid * group_size + cid] += dval;
+              if (d_scale_data)
+                d_scale_data[gid * group_size + cid] += val * dval;
+            }
           }
+
+          for (int cid = 0; cid < number; cid++) {
+            for (int imid = 0; imid < imsize;
+                 imid++, iter_d_x_data++, tmp_x++, tmp_y++) {
+              T v_y = tmp_x[0];
+              T dly = tmp_y[0];
+              T dss = dp_scale;
+              T dbs = dp_bias;
+              T v_scale = 1., v_bias = 0.;
+              if (scale_data) v_scale = scale_data[gid * group_size + cid];
+              if (bias_data) v_bias = bias_data[gid * group_size + cid];
+              v_y -= v_bias;
+              if (v_scale != 0) v_y /= v_scale;
+              iter_d_x_data[0] =
+                  (dly * v_scale - number_inv * dss * v_y - number_inv * dbs) *
+                  var_inv;
+            }
+          }
+        } else {
+          for (int cid = 0; cid < number; cid++) {
+            iter_x_data = x_src_data + cid;
+            iter_y_data = y_src_data + cid;
+            for (int imid = 0; imid < imsize;
+                 imid++, iter_x_data += C, iter_y_data += C) {
+              T val = iter_x_data[0];
+              if (bias_data) val -= bias_data[gid * group_size + cid];
+              T dval = iter_y_data[0];
+              dp_scale += val * dval;
+              if (scale_data)
+                dp_bias += dval * scale_data[gid * group_size + cid];
+
+              if (scale_data && scale_data[gid * group_size + cid] != 0)
+                val /= scale_data[gid * group_size + cid];
+              if (d_bias_data) d_bias_data[gid * group_size + cid] += dval;
+              if (d_scale_data)
+                d_scale_data[gid * group_size + cid] += val * dval;
+            }
+          }
+
+          for (int cid = 0; cid < number; cid++) {
+            tmp_x = x_src_data + cid;
+            tmp_y = y_src_data + cid;
+            iter_d_x_data = tmp_d_x + cid;
+            for (int imid = 0; imid < imsize;
+                 imid++, iter_d_x_data += C, tmp_x += C, tmp_y += C) {
+              T v_y = tmp_x[0];
+              T dly = tmp_y[0];
+              T dss = dp_scale;
+              T dbs = dp_bias;
+              T v_scale = 1.0, v_bias = 0.;
+              if (scale_data) v_scale = scale_data[gid * group_size + cid];
+              if (bias_data) v_bias = bias_data[gid * group_size + cid];
+              v_y -= v_bias;
+              if (v_scale != 0) v_y /= v_scale;
+              iter_d_x_data[0] =
+                  (dly * v_scale - number_inv * dss * v_y - number_inv * dbs) *
+                  var_inv;
+            }
+          }
+          iter_x_data = iter_x_data_backup + group_size;
+          iter_y_data = iter_y_data_backup + group_size;
+          iter_d_x_data = iter_d_x_data_backup + group_size;
         }
       }
+      if (data_layout == DataLayout::kNHWC) {
+        iter_x_data = x_data + (bid + 1) * C * imsize;
+        iter_d_x_data = d_x_data + (bid + 1) * C * imsize;
+        iter_y_data = y_data + (bid + 1) * C * imsize;
+      }
+    }
   }
 };
 

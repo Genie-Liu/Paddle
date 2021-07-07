@@ -27,6 +27,18 @@ namespace paddle {
 namespace inference {
 namespace tensorrt {
 
+#define IS_TRT_VERSION_GE(version)                       \
+  ((NV_TENSORRT_MAJOR * 1000 + NV_TENSORRT_MINOR * 100 + \
+    NV_TENSORRT_PATCH * 10 + NV_TENSORRT_BUILD) >= version)
+
+#define IS_TRT_VERSION_LT(version)                       \
+  ((NV_TENSORRT_MAJOR * 1000 + NV_TENSORRT_MINOR * 100 + \
+    NV_TENSORRT_PATCH * 10 + NV_TENSORRT_BUILD) < version)
+
+#define TRT_VERSION                                    \
+  NV_TENSORRT_MAJOR * 1000 + NV_TENSORRT_MINOR * 100 + \
+      NV_TENSORRT_PATCH * 10 + NV_TENSORRT_BUILD
+
 namespace dy = paddle::platform::dynload;
 
 // TensorRT data type to size
@@ -48,14 +60,25 @@ static nvinfer1::IRuntime* createInferRuntime(nvinfer1::ILogger* logger) {
   return static_cast<nvinfer1::IRuntime*>(
       dy::createInferRuntime_INTERNAL(logger, NV_TENSORRT_VERSION));
 }
+#if IS_TRT_VERSION_GE(6000)
+static nvinfer1::IPluginRegistry* GetPluginRegistry() {
+  return static_cast<nvinfer1::IPluginRegistry*>(dy::getPluginRegistry());
+}
+static int GetInferLibVersion() {
+  return static_cast<int>(dy::getInferLibVersion());
+}
+#endif
 
 // A logger for create TensorRT infer builder.
 class NaiveLogger : public nvinfer1::ILogger {
  public:
   void log(nvinfer1::ILogger::Severity severity, const char* msg) override {
     switch (severity) {
-      case Severity::kINFO:
+      case Severity::kVERBOSE:
         VLOG(3) << msg;
+        break;
+      case Severity::kINFO:
+        VLOG(2) << msg;
         break;
       case Severity::kWARNING:
         LOG(WARNING) << msg;
@@ -102,6 +125,27 @@ class NaiveProfiler : public nvinfer1::IProfiler {
     printf("Time over all layers: %4.3f\n", totalTime);
   }
 };
+
+inline size_t ProductDim(const nvinfer1::Dims& dims) {
+  size_t v = 1;
+  for (int i = 0; i < dims.nbDims; i++) {
+    v *= dims.d[i];
+  }
+  return v;
+}
+
+inline void PrintITensorShape(nvinfer1::ITensor* X) {
+  auto dims = X->getDimensions();
+  auto name = X->getName();
+  std::cout << "ITensor " << name << " shape: [";
+  for (int i = 0; i < dims.nbDims; i++) {
+    if (i == dims.nbDims - 1)
+      std::cout << dims.d[i];
+    else
+      std::cout << dims.d[i] << ", ";
+  }
+  std::cout << "]\n";
+}
 
 }  // namespace tensorrt
 }  // namespace inference

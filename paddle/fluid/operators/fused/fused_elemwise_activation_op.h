@@ -18,7 +18,6 @@ limitations under the License. */
 #include <vector>
 #include "paddle/fluid/framework/op_desc.h"
 #include "paddle/fluid/framework/op_registry.h"
-#include "paddle/fluid/operators/detail/safe_ref.h"
 #include "paddle/fluid/operators/elementwise/elementwise_op_function.h"
 #include "paddle/fluid/operators/math/compound_functors.h"
 #include "paddle/fluid/operators/math/functors.h"
@@ -255,8 +254,37 @@ static void RunFunctors(const framework::ExecutionContext &ctx,
                              paddle::operators::math::ScaleFunctor<T>>(
         ctx, paddle::operators::math::MulFunctor<T>(),
         paddle::operators::math::ScaleFunctor<T>(scale), in_x, in_y, outputs);
+  } else if (funcs_str == "tanh,elementwise_add") {
+    // Z = Unary(Binary(X, Y))
+    RunUnaryCompoundFunctors<DeviceContext, T,
+                             paddle::operators::math::TanhFunctor<T>,
+                             paddle::operators::math::AddFunctor<T>>(
+        ctx, paddle::operators::math::TanhFunctor<T>(),
+        paddle::operators::math::AddFunctor<T>(), in_x, in_y, outputs);
+  } else if (funcs_str == "elementwise_mul,tanh") {
+    // Z = Binary(X, Unary(Y))
+    RunBinaryCompoundFunctor<DeviceContext, T,
+                             paddle::operators::math::MulFunctor<T>,
+                             paddle::operators::math::TanhFunctor<T>>(
+        ctx, paddle::operators::math::MulFunctor<T>(),
+        paddle::operators::math::TanhFunctor<T>(), in_x, in_y, outputs);
+  } else if (funcs_str == "elementwise_mul,sigmoid") {
+    // Z = Binary(X, Unary(Y))
+    RunBinaryCompoundFunctor<DeviceContext, T,
+                             paddle::operators::math::MulFunctor<T>,
+                             paddle::operators::math::SigmoidFunctor<T>>(
+        ctx, paddle::operators::math::MulFunctor<T>(),
+        paddle::operators::math::SigmoidFunctor<T>(), in_x, in_y, outputs);
+  } else if (funcs_str == "gelu,elementwise_add") {
+    // Z = Unary(Binary(X, Y))
+    RunUnaryCompoundFunctors<DeviceContext, T,
+                             paddle::operators::math::GeluFunctor<T>,
+                             paddle::operators::math::AddFunctor<T>>(
+        ctx, paddle::operators::math::GeluFunctor<T>(),
+        paddle::operators::math::AddFunctor<T>(), in_x, in_y, outputs);
   } else {
-    PADDLE_THROW("%s has not been implemented.", funcs_str);
+    PADDLE_THROW(platform::errors::InvalidArgument(
+        "%s has not been implemented.", funcs_str));
   }
 }
 
@@ -293,6 +321,7 @@ static void RunGradFunctors(
         paddle::operators::math::AddGradFunctor<T>(), in_x, in_y, in_out,
         in_intermediate_out, in_out_grad, x_grad, y_grad, d_intermediate_out);
   } else if (funcs_str == "elementwise_add_grad,relu_grad") {
+    // The backward of Z = Binary(X, Unary(Y))
     RunBinaryCompoundGradFunctors<
         DeviceContext, T, paddle::operators::math::AddGradFunctor<T>,
         paddle::operators::math::ReluFunctor<T>,
@@ -302,6 +331,7 @@ static void RunGradFunctors(
         paddle::operators::math::ReluGradFunctor<T>(), in_x, in_y, in_out,
         in_intermediate_out, in_out_grad, x_grad, y_grad, d_intermediate_out);
   } else if (funcs_str == "relu_grad,elementwise_add_grad") {
+    // The backward of Z = Unary(Binary(X, Y))
     RunUnaryCompoundGradFunctors<
         DeviceContext, T, paddle::operators::math::ReluGradFunctor<T>,
         paddle::operators::math::AddFunctor<T>,
@@ -321,8 +351,49 @@ static void RunGradFunctors(
         paddle::operators::math::ScaleFunctor<T>(scale),
         paddle::operators::math::ScaleGradFunctor<T>(scale), in_x, in_y, in_out,
         in_intermediate_out, in_out_grad, x_grad, y_grad, d_intermediate_out);
+  } else if (funcs_str == "tanh_grad,elementwise_add_grad") {
+    // The backward of Z = Unary(Binary(X, Y))
+    RunUnaryCompoundGradFunctors<
+        DeviceContext, T, paddle::operators::math::TanhGradFunctor<T>,
+        paddle::operators::math::AddFunctor<T>,
+        paddle::operators::math::AddGradFunctor<T>, InPlace>(
+        ctx, paddle::operators::math::TanhGradFunctor<T>(),
+        paddle::operators::math::AddFunctor<T>(),
+        paddle::operators::math::AddGradFunctor<T>(), in_x, in_y, in_out,
+        in_intermediate_out, in_out_grad, x_grad, y_grad, d_intermediate_out);
+  } else if (funcs_str == "elementwise_mul_grad,tanh_grad") {
+    // The backward of Z = Binary(X, Unary(Y))
+    RunBinaryCompoundGradFunctors<
+        DeviceContext, T, paddle::operators::math::MulGradFunctor<T>,
+        paddle::operators::math::TanhFunctor<T>,
+        paddle::operators::math::TanhGradFunctor<T>, InPlace>(
+        ctx, paddle::operators::math::MulGradFunctor<T>(),
+        paddle::operators::math::TanhFunctor<T>(),
+        paddle::operators::math::TanhGradFunctor<T>(), in_x, in_y, in_out,
+        in_intermediate_out, in_out_grad, x_grad, y_grad, d_intermediate_out);
+  } else if (funcs_str == "elementwise_mul_grad,sigmoid_grad") {
+    // The backward of Z = Binary(X, Unary(Y))
+    RunBinaryCompoundGradFunctors<
+        DeviceContext, T, paddle::operators::math::MulGradFunctor<T>,
+        paddle::operators::math::SigmoidFunctor<T>,
+        paddle::operators::math::SigmoidGradFunctor<T>, InPlace>(
+        ctx, paddle::operators::math::MulGradFunctor<T>(),
+        paddle::operators::math::SigmoidFunctor<T>(),
+        paddle::operators::math::SigmoidGradFunctor<T>(), in_x, in_y, in_out,
+        in_intermediate_out, in_out_grad, x_grad, y_grad, d_intermediate_out);
+  } else if (funcs_str == "gelu_grad,elementwise_add_grad") {
+    // The backward of Z = Unary(Binary(X, Y))
+    RunUnaryCompoundGradFunctors<
+        DeviceContext, T, paddle::operators::math::GeluGradFunctor<T>,
+        paddle::operators::math::AddFunctor<T>,
+        paddle::operators::math::AddGradFunctor<T>, InPlace>(
+        ctx, paddle::operators::math::GeluGradFunctor<T>(),
+        paddle::operators::math::AddFunctor<T>(),
+        paddle::operators::math::AddGradFunctor<T>(), in_x, in_y, in_out,
+        in_intermediate_out, in_out_grad, x_grad, y_grad, d_intermediate_out);
   } else {
-    PADDLE_THROW("%s has not been implemented.", funcs_str);
+    PADDLE_THROW(platform::errors::InvalidArgument(
+        "%s has not been implemented.", funcs_str));
   }
 }
 
@@ -330,22 +401,25 @@ template <typename DeviceContext, typename T>
 class FusedElemwiseActivationKernel : public framework::OpKernel<T> {
  public:
   void Compute(const framework::ExecutionContext &ctx) const override {
-    auto &in_x = detail::Ref(ctx.Input<framework::Tensor>("X"),
-                             "Cannot get input tensor %s, variable name = %s",
-                             "X", ctx.op().Input("X"));
-    auto &in_y = detail::Ref(ctx.Input<framework::Tensor>("Y"),
-                             "Cannot get input tensor %s, variable name = %s",
-                             "Y", ctx.op().Input("Y"));
-    PADDLE_ENFORCE(ctx.HasOutput("Out"), "The output(Out) should not be empty");
+    auto &in_x = GET_DATA_SAFELY(ctx.Input<framework::Tensor>("X"), "Input",
+                                 "X", "FusedElemwiseActivation");
+    auto &in_y = GET_DATA_SAFELY(ctx.Input<framework::Tensor>("Y"), "Input",
+                                 "Y", "FusedElemwiseActivation");
+
+    PADDLE_ENFORCE_EQ(ctx.HasOutput("Out"), true,
+                      platform::errors::InvalidArgument(
+                          "The output(Out) should not be empty"));
     auto output = ctx.Output<framework::Tensor>("Out");
 
     std::vector<framework::Tensor *> outputs;
     outputs.emplace_back(output);
 
     if (ctx.Attr<bool>("save_intermediate_out")) {
-      PADDLE_ENFORCE(ctx.HasOutput("IntermediateOut"),
-                     "The save_intermediate_out is enable, so the "
-                     "IntermediateOut should not be empty.");
+      PADDLE_ENFORCE_EQ(ctx.HasOutput("IntermediateOut"), true,
+                        platform::errors::InvalidArgument(
+                            "The save_intermediate_out is enable, so the "
+                            "IntermediateOut should not be empty."));
+
       auto intermediate_out = ctx.Output<framework::Tensor>("IntermediateOut");
       outputs.emplace_back(intermediate_out);
     } else {
@@ -361,13 +435,18 @@ class FusedElemwiseActivationGradKernel : public framework::OpKernel<T> {
  public:
   void Compute(const framework::ExecutionContext &ctx) const override {
     auto in_y = ctx.Input<framework::Tensor>("Y");
-    PADDLE_ENFORCE(in_y != nullptr, "Input(Y) should not be nullptr.");
+    PADDLE_ENFORCE_NE(in_y, nullptr, platform::errors::InvalidArgument(
+                                         "Input(Y) should not be nullptr."));
     auto in_out = ctx.Input<framework::Tensor>("Out");
-    PADDLE_ENFORCE(in_out != nullptr, "Input(Out) should not be nullptr.");
+    PADDLE_ENFORCE_NE(
+        in_out, nullptr,
+        platform::errors::InvalidArgument("Input(Out) should not be nullptr."));
     auto in_out_grad =
         ctx.Input<framework::Tensor>(framework::GradVarName("Out"));
-    PADDLE_ENFORCE(in_out_grad != nullptr,
-                   "Input(Out@Grad) should not be nullptr.");
+    PADDLE_ENFORCE_NE(in_out_grad, nullptr,
+                      platform::errors::InvalidArgument(
+                          "Input(Out@Grad) should not be nullptr."));
+
     framework::Tensor *in_x =
         const_cast<framework::Tensor *>(ctx.Input<framework::Tensor>("X"));
     framework::Tensor *x_grad =
@@ -387,24 +466,28 @@ class FusedElemwiseActivationGradKernel : public framework::OpKernel<T> {
       // recompute.
       in_intermediate_out = const_cast<framework::Tensor *>(
           ctx.Input<framework::Tensor>("IntermediateOut"));
-      PADDLE_ENFORCE(in_intermediate_out != nullptr,
-                     "The option of 'save_intermediate_out' is opened, "
-                     "so the number of 'Out' should be two.");
+      PADDLE_ENFORCE_NE(in_intermediate_out, nullptr,
+                        platform::errors::InvalidArgument(
+                            "The option of 'save_intermediate_out' is opened,"
+                            " so the number of 'Out' should be two."));
     } else {
       if (!InputXCanBeAbsent(functor_list)) {
-        PADDLE_ENFORCE(in_x != nullptr, "Input(X) should not be null.");
+        PADDLE_ENFORCE_NE(in_x, nullptr, platform::errors::InvalidArgument(
+                                             "Input(X) should not be null."));
       }
     }
 
     // Get in_x
     if (ctx.HasInput("X")) {
-      PADDLE_ENFORCE(in_x != nullptr, "Input(X) should not be nullptr.");
+      PADDLE_ENFORCE_NE(in_x, nullptr, platform::errors::InvalidArgument(
+                                           "Input(X) should not be null."));
     } else {
       // If functor_list contains elementwise_add, the backward doesn't use
       // in_x, in_y and in_out.
-      PADDLE_ENFORCE(InputXCanBeAbsent(functor_list),
-                     "Only when the compoundfunctor contains "
-                     "elementwise_add_grad, the 'X' could be absent.");
+      PADDLE_ENFORCE_EQ(InputXCanBeAbsent(functor_list), true,
+                        platform::errors::InvalidArgument(
+                            "Only when the compoundfunctor contains "
+                            "elementwise_add_grad, the 'X' could be absent."));
       in_x = const_cast<framework::Tensor *>(in_out_grad);
     }
 

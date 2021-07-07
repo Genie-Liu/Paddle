@@ -33,9 +33,11 @@ class FastThreadedSSAGraphExecutor : public SSAGraphExecutor {
  public:
   FastThreadedSSAGraphExecutor(const ExecutionStrategy &strategy,
                                const std::vector<Scope *> &local_scopes,
+                               const std::vector<Scope *> &local_exec_scopes,
                                const std::vector<platform::Place> &places,
                                ir::Graph *graph);
-  FeedFetchList Run(const std::vector<std::string> &fetch_tensors) override;
+  FetchResultType Run(const std::vector<std::string> &fetch_tensors,
+                      bool return_merged) override;
   const ir::Graph &Graph() const override;
 
  private:
@@ -43,6 +45,7 @@ class FastThreadedSSAGraphExecutor : public SSAGraphExecutor {
   // be destroyed first.
   ExecutionStrategy strategy_;
   std::vector<Scope *> local_scopes_;
+  std::vector<Scope *> local_exec_scopes_;
   std::vector<platform::Place> places_;
   ir::Graph *graph_;
 
@@ -60,11 +63,33 @@ class FastThreadedSSAGraphExecutor : public SSAGraphExecutor {
   ::ThreadPool pool_;
   ::ThreadPool prepare_pool_;
 
+  std::vector<OpHandleBase *> traced_ops_;
+
+  bool RunOp(OpHandleBase *op,
+             const std::shared_ptr<BlockingQueue<size_t>> &complete_q,
+             size_t *complete);
+
   void RunOpAsync(std::unordered_map<OpHandleBase *, std::atomic<int>> *op_deps,
                   OpHandleBase *op,
                   const std::shared_ptr<BlockingQueue<size_t>> &complete_q);
 
   void PrepareAtomicOpDeps();
+
+  inline void RecordOps(OpHandleBase *op);
+
+  inline void ExecutionFinal(std::vector<OpHandleBase *> *fetch_ops);
+
+  inline bool RunOpSync(OpHandleBase *op);
+
+  bool RunTracedOps(const std::vector<OpHandleBase *> &traced_ops);
+
+  void InsertFetchOps(
+      const std::vector<std::string> &fetch_tensors, FetchResultType *fetches,
+      std::unordered_map<std::string, std::vector<VarHandleBase *>>
+          *fetched_vars,
+      std::unordered_map<OpHandleBase *, std::atomic<int>> *op_deps,
+      std::vector<OpHandleBase *> *fetch_ops,
+      std::vector<OpHandleBase *> *ready_fetch_ops, bool return_merged);
 };
 }  // namespace details
 }  // namespace framework

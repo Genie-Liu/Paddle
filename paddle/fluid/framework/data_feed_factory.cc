@@ -13,14 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include "paddle/fluid/framework/data_feed_factory.h"
+
+#include <stdlib.h>
 #include <memory>
 #include <string>
-#include <unordered_map>
 
-#include "paddle/fluid/framework/data_feed.h"
+#include "glog/logging.h"
 
 namespace paddle {
 namespace framework {
+class DataFeed;
+
 typedef std::shared_ptr<DataFeed> (*Createdata_feedFunction)();
 typedef std::unordered_map<std::string, Createdata_feedFunction> data_feedMap;
 data_feedMap g_data_feed_map;
@@ -54,11 +57,19 @@ std::string DataFeedFactory::DataFeedTypeList() {
 std::shared_ptr<DataFeed> DataFeedFactory::CreateDataFeed(
     std::string data_feed_class) {
   if (g_data_feed_map.count(data_feed_class) < 1) {
+    LOG(WARNING) << "Your DataFeed " << data_feed_class
+                 << "is not supported currently";
+    LOG(WARNING) << "Supported DataFeed: " << DataFeedTypeList();
     exit(-1);
   }
   return g_data_feed_map[data_feed_class]();
 }
 
 REGISTER_DATAFEED_CLASS(MultiSlotDataFeed);
+REGISTER_DATAFEED_CLASS(MultiSlotInMemoryDataFeed);
+REGISTER_DATAFEED_CLASS(PaddleBoxDataFeed);
+#if (defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_HIP)) && !defined(_WIN32)
+REGISTER_DATAFEED_CLASS(MultiSlotFileInstantDataFeed);
+#endif
 }  // namespace framework
 }  // namespace paddle

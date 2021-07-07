@@ -39,14 +39,22 @@ class PReluKernel : public framework::OpKernel<T> {
     int index = 0;
     int i = 0;
     if (mode == "channel") {
-      int temp = numel / (dim[0] * dim[1]);
+      int temp = 1;
+      for (int j = 2; j < dim.size(); j++) {
+        temp *= dim[j];
+      }
       for (i = 0; i < numel; i++) {
         index = (i / temp) % dim[1];
         o_ptr[i] = x_ptr[i] > 0 ? x_ptr[i] : alpha_ptr[index] * x_ptr[i];
       }
     } else if (mode == "element") {
+      int temp = 1;
+      for (int j = 1; j < dim.size(); j++) {
+        temp *= dim[j];
+      }
       for (i = 0; i < numel; i++) {
-        o_ptr[i] = x_ptr[i] > 0 ? x_ptr[i] : alpha_ptr[i] * x_ptr[i];
+        index = i % temp;
+        o_ptr[i] = x_ptr[i] > 0 ? x_ptr[i] : alpha_ptr[index] * x_ptr[i];
       }
     } else {
       for (i = 0; i < numel; i++) {
@@ -64,34 +72,40 @@ class PReluGradKernel : public framework::OpKernel<T> {
     auto* dx = context.Output<Tensor>(framework::GradVarName("X"));
     auto* dout = context.Input<Tensor>(framework::GradVarName("Out"));
     auto* dalpha = context.Output<Tensor>(framework::GradVarName("Alpha"));
-    auto* out = context.Input<Tensor>("Out");
     auto* alpha = context.Input<Tensor>("Alpha");
     const T* alpha_ptr = alpha->data<T>();
     const T* x_ptr = x->data<T>();
     const T* dout_ptr = dout->data<T>();
-    const T* out_ptr = out->data<T>();
     std::string mode = context.Attr<std::string>("mode");
     int numel = x->numel();
     auto dim = x->dims();
     int index = 0;
     int i = 0;
-    int temp = 0;
     if (dx) {
       T* dx_ptr = dx->mutable_data<T>(context.GetPlace());
       if (mode == "channel") {
+        int temp = 1;
+        for (int j = 2; j < dim.size(); j++) {
+          temp *= dim[j];
+        }
         for (i = 0; i < numel; i++) {
-          temp = numel / (dim[0] * dim[1]);
           index = (i / temp) % dim[1];
           dx_ptr[i] =
-              out_ptr[i] > 0 ? dout_ptr[i] : alpha_ptr[index] * dout_ptr[i];
+              x_ptr[i] > 0 ? dout_ptr[i] : alpha_ptr[index] * dout_ptr[i];
         }
       } else if (mode == "element") {
+        int temp = 1;
+        for (int j = 1; j < dim.size(); j++) {
+          temp *= dim[j];
+        }
         for (i = 0; i < numel; i++) {
-          dx_ptr[i] = out_ptr[i] > 0 ? dout_ptr[i] : alpha_ptr[i] * dout_ptr[i];
+          index = i % temp;
+          dx_ptr[i] =
+              x_ptr[i] > 0 ? dout_ptr[i] : alpha_ptr[index] * dout_ptr[i];
         }
       } else {
         for (i = 0; i < numel; i++) {
-          dx_ptr[i] = out_ptr[i] > 0 ? dout_ptr[i] : alpha_ptr[0] * dout_ptr[i];
+          dx_ptr[i] = x_ptr[i] > 0 ? dout_ptr[i] : alpha_ptr[0] * dout_ptr[i];
         }
       }
     }
@@ -102,18 +116,26 @@ class PReluGradKernel : public framework::OpKernel<T> {
       memset(dalpha_ptr, 0, sizeof(T) * dalpha->numel());
 
       if (mode == "channel") {
+        int temp = 1;
+        for (int j = 2; j < dim.size(); j++) {
+          temp *= dim[j];
+        }
         for (i = 0; i < numel; i++) {
-          temp = numel / (dim[0] * dim[1]);
           index = (i / temp) % dim[1];
-          dalpha_ptr[index] += out_ptr[i] > 0 ? 0 : x_ptr[i] * dout_ptr[i];
+          dalpha_ptr[index] += x_ptr[i] > 0 ? 0 : x_ptr[i] * dout_ptr[i];
         }
       } else if (mode == "element") {
+        int temp = 1;
+        for (int j = 1; j < dim.size(); j++) {
+          temp *= dim[j];
+        }
         for (i = 0; i < numel; i++) {
-          dalpha_ptr[i] += out_ptr[i] > 0 ? 0 : x_ptr[i] * dout_ptr[i];
+          index = i % temp;
+          dalpha_ptr[index] += x_ptr[i] > 0 ? 0 : x_ptr[i] * dout_ptr[i];
         }
       } else {
         for (i = 0; i < numel; i++) {
-          dalpha_ptr[0] += out_ptr[i] > 0 ? 0 : x_ptr[i] * dout_ptr[i];
+          dalpha_ptr[0] += x_ptr[i] > 0 ? 0 : x_ptr[i] * dout_ptr[i];
         }
       }
     }

@@ -36,20 +36,13 @@ import tarfile
 import gzip
 from collections import defaultdict
 
-import paddle.dataset.common
+import paddle
 import paddle.compat as cpt
+import paddle.utils.deprecated as deprecated
 
-__all__ = [
-    "train",
-    "test",
-    "validation",
-    "convert",
-    "fetch",
-    "get_dict",
-]
+__all__ = []
 
-DATA_URL = ("http://cloud.dlnel.org/filepub/"
-            "?uuid=46a0808e-ddd8-427c-bacd-0dbc6d045fed")
+DATA_URL = ("http://paddlemodels.bj.bcebos.com/wmt/wmt16.tar.gz")
 DATA_MD5 = "0c38be43600334966403524a40dcd81e"
 
 TOTAL_EN_WORDS = 11250
@@ -114,7 +107,7 @@ def reader_creator(tar_file, file_name, src_dict_size, trg_dict_size, src_lang):
         trg_dict = __load_dict(tar_file, trg_dict_size,
                                ("de" if src_lang == "en" else "en"))
 
-        # the indice for start mark, end mark, and unk are the same in source
+        # the index for start mark, end mark, and unk are the same in source
         # language and target language. Here uses the source language
         # dictionary to determine their indices.
         start_id = src_dict[START_MARK]
@@ -146,6 +139,11 @@ def reader_creator(tar_file, file_name, src_dict_size, trg_dict_size, src_lang):
     return reader
 
 
+@deprecated(
+    since="2.0.0",
+    update_to="paddle.text.datasets.WMT16",
+    level=1,
+    reason="Please use new dataset API which supports paddle.io.DataLoader")
 def train(src_dict_size, trg_dict_size, src_lang="en"):
     """
     WMT16 train set reader.
@@ -195,6 +193,11 @@ def train(src_dict_size, trg_dict_size, src_lang="en"):
         src_lang=src_lang)
 
 
+@deprecated(
+    since="2.0.0",
+    update_to="paddle.text.datasets.WMT16",
+    level=1,
+    reason="Please use new dataset API which supports paddle.io.DataLoader")
 def test(src_dict_size, trg_dict_size, src_lang="en"):
     """
     WMT16 test set reader.
@@ -244,6 +247,11 @@ def test(src_dict_size, trg_dict_size, src_lang="en"):
         src_lang=src_lang)
 
 
+@deprecated(
+    since="2.0.0",
+    update_to="paddle.text.datasets.WMT16",
+    level=1,
+    reason="Please use new dataset API which supports paddle.io.DataLoader")
 def validation(src_dict_size, trg_dict_size, src_lang="en"):
     """
     WMT16 validation set reader.
@@ -291,6 +299,11 @@ def validation(src_dict_size, trg_dict_size, src_lang="en"):
         src_lang=src_lang)
 
 
+@deprecated(
+    since="2.0.0",
+    update_to="paddle.text.datasets.WMT16",
+    level=1,
+    reason="Please use new dataset API which supports paddle.io.DataLoader")
 def get_dict(lang, dict_size, reverse=False):
     """
     return the word dictionary for the specified language.
@@ -321,38 +334,13 @@ def get_dict(lang, dict_size, reverse=False):
     return __load_dict(tar_file, dict_size, lang, reverse)
 
 
+@deprecated(
+    since="2.0.0",
+    update_to="paddle.text.datasets.WMT16",
+    level=1,
+    reason="Please use new dataset API which supports paddle.io.DataLoader")
 def fetch():
     """download the entire dataset.
     """
     paddle.v4.dataset.common.download(DATA_URL, "wmt16", DATA_MD5,
                                       "wmt16.tar.gz")
-
-
-def convert(path, src_dict_size, trg_dict_size, src_lang):
-    """Converts dataset to recordio format.
-    """
-
-    paddle.dataset.common.convert(
-        path,
-        train(
-            src_dict_size=src_dict_size,
-            trg_dict_size=trg_dict_size,
-            src_lang=src_lang),
-        1000,
-        "wmt16_train")
-    paddle.dataset.common.convert(
-        path,
-        test(
-            src_dict_size=src_dict_size,
-            trg_dict_size=trg_dict_size,
-            src_lang=src_lang),
-        1000,
-        "wmt16_test")
-    paddle.dataset.common.convert(
-        path,
-        validation(
-            src_dict_size=src_dict_size,
-            trg_dict_size=trg_dict_size,
-            src_lang=src_lang),
-        1000,
-        "wmt16_validation")

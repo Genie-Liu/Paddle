@@ -29,7 +29,7 @@ class LoadOp : public framework::OperatorWithKernel {
   framework::OpKernelType GetExpectedKernelType(
       const framework::ExecutionContext &ctx) const override {
     framework::OpKernelType kt = framework::OpKernelType(
-        framework::proto::VarType::FP32, platform::CPUPlace());
+        framework::proto::VarType::FP32, ctx.GetPlace());
     return kt;
   }
 };
@@ -48,8 +48,14 @@ class LoadOpProtoMaker : public framework::OpProtoAndCheckerMaker {
                          R"(Variable will be loaded from "file_path")")
         .AddCustomChecker(
             [](const std::string &path) { return !path.empty(); });
+    AddAttr<int64_t>("seek", "(int64_t) Starting for load tensor from seek pos")
+        .SetDefault(-1);
+    AddAttr<std::vector<int64_t>>("shape",
+                                  "(vector<int64_t>) The shape of the output")
+        .SetDefault({});
     AddComment(
-        "Load operator will load a LoDTensor / SelectedRows variable from disk "
+        "Load operator will load a LoDTensor / SelectedRows variable from "
+        "disk "
         "file.");
   }
 };
@@ -63,6 +69,8 @@ REGISTER_OPERATOR(load, ops::LoadOp, ops::LoadOpProtoMaker);
 REGISTER_OP_CPU_KERNEL(
     load, ops::LoadOpKernel<paddle::platform::CPUDeviceContext, float>,
     ops::LoadOpKernel<paddle::platform::CPUDeviceContext, double>,
+    ops::LoadOpKernel<paddle::platform::CPUDeviceContext,
+                      paddle::platform::bfloat16>,
     ops::LoadOpKernel<paddle::platform::CPUDeviceContext, int>,
     ops::LoadOpKernel<paddle::platform::CPUDeviceContext, int8_t>,
     ops::LoadOpKernel<paddle::platform::CPUDeviceContext, int64_t>);

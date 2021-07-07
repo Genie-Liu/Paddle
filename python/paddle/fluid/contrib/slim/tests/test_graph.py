@@ -15,11 +15,14 @@
 from __future__ import print_function
 import os
 import six
+import numpy as np
 import unittest
 import paddle
 import paddle.fluid as fluid
 from paddle.fluid.framework import IrGraph
 from paddle.fluid import core
+
+paddle.enable_static()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["CPU_NUM"] = "1"
@@ -53,10 +56,11 @@ class TestGraph(unittest.TestCase):
     def graph_apis(self, use_cuda=False, for_ci=True):
         main = fluid.Program()
         startup = fluid.Program()
-        with fluid.program_guard(main, startup):
-            feeds, loss = conv_block()
-            opt = fluid.optimizer.Adam(learning_rate=0.001)
-            opt.minimize(loss)
+        with fluid.unique_name.guard():
+            with fluid.program_guard(main, startup):
+                feeds, loss = conv_block()
+                opt = fluid.optimizer.Adam(learning_rate=0.001)
+                opt.minimize(loss)
         graph = IrGraph(core.Graph(main.desc), for_test=False)
         backup_graph = graph.clone()
         self.assertEqual(len(graph.all_nodes()), len(backup_graph.all_nodes()))
@@ -77,16 +81,39 @@ class TestGraph(unittest.TestCase):
             paddle.dataset.mnist.train(), batch_size=batch_size)
         feeder = fluid.DataFeeder(feed_list=feeds, place=place)
 
-        def train(binary):
+        def _train(binary):
             for _ in range(iters):
                 data = next(train_reader())
                 loss_v = exe.run(binary,
                                  feed=feeder.feed(data),
                                  fetch_list=[loss.name])
-                print('{}: {}'.format('loss', loss_v))
+                if not for_ci:
+                    print('{}: {}'.format('loss', loss_v))
 
-        train(origin_binary)
-        train(backup_binary)
+        _train(origin_binary)
+        _train(backup_binary)
+
+        checkponit_dir = "checkpoint_gpu" if use_cuda else "checkpoint_cpu"
+
+        def _set_zero(var_name, scope, place):
+            var = scope.find_var(var_name).get_tensor()
+            var_array = np.zeros(var._get_dims()).astype("float32")
+            var.set(var_array, place)
+
+        sum_before = np.sum(
+            np.array(fluid.global_scope().find_var('conv2d_1.w_0').get_tensor(
+            )))
+        fluid.io._save_persistable_nodes(exe, checkponit_dir, graph)
+        _set_zero('conv2d_1.w_0', fluid.global_scope(), place)
+        set_after = np.sum(
+            np.array(fluid.global_scope().find_var('conv2d_1.w_0').get_tensor(
+            )))
+        self.assertEqual(set_after, 0)
+        fluid.io._load_persistable_nodes(exe, checkponit_dir, graph)
+        sum_after = np.sum(
+            np.array(fluid.global_scope().find_var('conv2d_1.w_0').get_tensor(
+            )))
+        self.assertEqual(sum_before, sum_after)
 
         marked_nodes = set()
         for op in graph.all_op_nodes():
@@ -98,7 +125,7 @@ class TestGraph(unittest.TestCase):
             for op in backup_graph.all_op_nodes():
                 if op.name().find('conv2d') > -1:
                     backup_marked_nodes.add(op)
-            backup_graph.draw('.', 'backup', backup_marked_nodes)
+            backup_graph.draw('./origin', 'backup', backup_marked_nodes)
         self.assertFalse(graph.has_circle())
         self.assertEqual(graph.graph_num(), 1)
         nodes = graph.topology_sort()

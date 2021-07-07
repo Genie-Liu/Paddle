@@ -21,13 +21,15 @@ parse training set and test set into paddle reader creators.
 from __future__ import print_function
 
 import paddle.dataset.common
+import paddle.utils.deprecated as deprecated
 import gzip
 import numpy
 import struct
 from six.moves import range
-__all__ = ['train', 'test', 'convert']
 
-URL_PREFIX = 'http://yann.lecun.com/exdb/mnist/'
+__all__ = []
+
+URL_PREFIX = 'https://dataset.bj.bcebos.com/mnist/'
 TEST_IMAGE_URL = URL_PREFIX + 't10k-images-idx3-ubyte.gz'
 TEST_IMAGE_MD5 = '9fb629c4189551a2d022fa330f9573f3'
 TEST_LABEL_URL = URL_PREFIX + 't10k-labels-idx1-ubyte.gz'
@@ -78,19 +80,27 @@ def reader_creator(image_filename, label_filename, buffer_size):
                         buffer_size, rows * cols)).astype('float32')
                     offset_img += struct.calcsize(fmt_images)
 
-                    images = images / 255.0 * 2.0 - 1.0
+                    images = images / 255.0
+                    images = images * 2.0
+                    images = images - 1.0
+
                     for i in range(buffer_size):
                         yield images[i, :], int(labels[i])
 
     return reader
 
 
+@deprecated(
+    since="2.0.0",
+    update_to="paddle.vision.datasets.MNIST",
+    level=1,
+    reason="Please use new dataset API which supports paddle.io.DataLoader")
 def train():
     """
     MNIST training set creator.
 
     It returns a reader creator, each sample in the reader is image pixels in
-    [0, 1] and label in [0, 9].
+    [-1, 1] and label in [0, 9].
 
     :return: Training reader creator
     :rtype: callable
@@ -102,12 +112,17 @@ def train():
                                        TRAIN_LABEL_MD5), 100)
 
 
+@deprecated(
+    since="2.0.0",
+    update_to="paddle.vision.datasets.MNIST",
+    level=1,
+    reason="Please use new dataset API which supports paddle.io.DataLoader")
 def test():
     """
     MNIST test set creator.
 
     It returns a reader creator, each sample in the reader is image pixels in
-    [0, 1] and label in [0, 9].
+    [-1, 1] and label in [0, 9].
 
     :return: Test reader creator.
     :rtype: callable
@@ -118,16 +133,13 @@ def test():
         100)
 
 
+@deprecated(
+    since="2.0.0",
+    update_to="paddle.vision.datasets.MNIST",
+    level=1,
+    reason="Please use new dataset API which supports paddle.io.DataLoader")
 def fetch():
     paddle.dataset.common.download(TRAIN_IMAGE_URL, 'mnist', TRAIN_IMAGE_MD5)
     paddle.dataset.common.download(TRAIN_LABEL_URL, 'mnist', TRAIN_LABEL_MD5)
     paddle.dataset.common.download(TEST_IMAGE_URL, 'mnist', TEST_IMAGE_MD5)
     paddle.dataset.common.download(TEST_LABEL_URL, 'mnist', TEST_LABEL_MD5)
-
-
-def convert(path):
-    """
-    Converts dataset to recordio format
-    """
-    paddle.dataset.common.convert(path, train(), 1000, "minist_train")
-    paddle.dataset.common.convert(path, test(), 1000, "minist_test")

@@ -15,14 +15,12 @@
 import contextlib
 import unittest
 import numpy as np
-import six
 import sys
 
 import paddle
 import paddle.fluid as fluid
 import paddle.fluid.core as core
 from paddle.fluid.optimizer import AdamOptimizer
-from paddle.fluid.dygraph.nn import Conv2D, Pool2D, FC
 from test_imperative_base import new_program_scope
 from paddle.fluid.dygraph.base import to_variable
 
@@ -31,7 +29,7 @@ def gen_data():
     pass
 
 
-class GraphConv(fluid.dygraph.Layer):
+class GraphConv(fluid.Layer):
     def __init__(self, name_scope, in_features, out_features):
         super(GraphConv, self).__init__(name_scope)
 
@@ -50,7 +48,7 @@ class GraphConv(fluid.dygraph.Layer):
         return fluid.layers.matmul(adj, support) + self.bias
 
 
-class GCN(fluid.dygraph.Layer):
+class GCN(fluid.Layer):
     def __init__(self, name_scope, num_hidden):
         super(GCN, self).__init__(name_scope)
         self.gc = GraphConv(self.full_name(), num_hidden, 32)
@@ -63,12 +61,10 @@ class GCN(fluid.dygraph.Layer):
 
 class TestDygraphGNN(unittest.TestCase):
     def test_gnn_float32(self):
-        seed = 90
-
+        paddle.seed(90)
+        paddle.framework.random._manual_program_seed(90)
         startup = fluid.Program()
-        startup.random_seed = seed
         main = fluid.Program()
-        main.random_seed = seed
 
         scope = fluid.core.Scope()
         with new_program_scope(main=main, startup=startup, scope=scope):
@@ -103,11 +99,11 @@ class TestDygraphGNN(unittest.TestCase):
             ) if not core.is_compiled_with_cuda() else fluid.CUDAPlace(0))
             exe.run(startup)
             static_loss = exe.run(feed={
-                'features': np.zeros(
+                'features': np.ones(
                     [1, 100, 50], dtype=np.float32),
-                'adj': np.zeros(
+                'adj': np.ones(
                     [1, 100, 100], dtype=np.float32),
-                'labels': np.zeros(
+                'labels': np.ones(
                     [100, 1], dtype=np.int64)
             },
                                   fetch_list=[loss])[0]
@@ -116,13 +112,13 @@ class TestDygraphGNN(unittest.TestCase):
                 scope.find_var(model.gc.weight.name).get_tensor())
 
         with fluid.dygraph.guard():
-            fluid.default_startup_program().random_seed = seed
-            fluid.default_main_program().random_seed = seed
+            paddle.seed(90)
+            paddle.framework.random._manual_program_seed(90)
 
-            features = np.zeros([1, 100, 50], dtype=np.float32)
+            features = np.ones([1, 100, 50], dtype=np.float32)
             # Use selected rows when it's supported.
-            adj = np.zeros([1, 100, 100], dtype=np.float32)
-            labels = np.zeros([100, 1], dtype=np.int64)
+            adj = np.ones([1, 100, 100], dtype=np.float32)
+            labels = np.ones([100, 1], dtype=np.int64)
 
             model = GCN('test_gcn', 50)
             logits = model(to_variable(features), to_variable(adj))
@@ -132,12 +128,45 @@ class TestDygraphGNN(unittest.TestCase):
             loss = fluid.layers.softmax_with_cross_entropy(logits,
                                                            to_variable(labels))
             loss = fluid.layers.reduce_sum(loss)
-            adam = AdamOptimizer(learning_rate=1e-3)
+            loss.backward()
+            adam = AdamOptimizer(
+                learning_rate=1e-3, parameter_list=model.parameters())
+
             adam.minimize(loss)
-            self.assertEqual(static_loss, loss._numpy())
-            self.assertTrue(
-                np.allclose(static_weight, model.gc.weight._numpy()))
-            sys.stderr.write('%s %s\n' % (static_loss, loss._numpy()))
+            model.clear_gradients()
+            loss_value = loss.numpy()
+            model_gc_weight_value = model.gc.weight.numpy()
+
+        with fluid.dygraph.guard():
+            paddle.seed(90)
+            paddle.framework.random._manual_program_seed(90)
+
+            features2 = np.ones([1, 100, 50], dtype=np.float32)
+            # Use selected rows when it's supported.
+            adj2 = np.ones([1, 100, 100], dtype=np.float32)
+            labels2 = np.ones([100, 1], dtype=np.int64)
+
+            model2 = GCN('test_gcn', 50)
+            logits2 = model2(to_variable(features2), to_variable(adj2))
+            logits2 = fluid.layers.reshape(logits2, logits2.shape[1:])
+            # In other example, it's nll with log_softmax. However, paddle's
+            # log_loss only supports binary classification now.
+            loss2 = fluid.layers.softmax_with_cross_entropy(
+                logits2, to_variable(labels2))
+            loss2 = fluid.layers.reduce_sum(loss2)
+            loss2.backward()
+            adam2 = AdamOptimizer(
+                learning_rate=1e-3, parameter_list=model2.parameters())
+            adam2.minimize(loss2)
+            model2.clear_gradients()
+            loss2_value = loss2.numpy()
+            model2_gc_weight_value = model2.gc.weight.numpy()
+
+        self.assertEqual(static_loss, loss_value)
+        self.assertTrue(np.allclose(static_weight, model_gc_weight_value))
+        self.assertEqual(static_loss, loss2_value)
+        self.assertTrue(np.allclose(static_weight, model2_gc_weight_value))
+        sys.stderr.write('%s %s\n' % (static_loss, loss_value))
 
 
 if __name__ == '__main__':

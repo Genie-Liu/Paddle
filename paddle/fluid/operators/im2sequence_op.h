@@ -18,6 +18,7 @@
 #include "paddle/fluid/framework/data_layout.h"
 #include "paddle/fluid/framework/eigen.h"
 #include "paddle/fluid/framework/op_registry.h"
+#include "paddle/fluid/operators/eigen/eigen_function.h"
 #include "paddle/fluid/operators/math/im2col.h"
 #include "paddle/fluid/operators/math/math_function.h"
 
@@ -113,9 +114,10 @@ class Im2SequenceKernel : public framework::OpKernel<T> {
                                            paddings[2], strides[0]);
       int output_width = Im2SeqOutputSize(img_width, kernels[1], paddings[1],
                                           paddings[3], strides[1]);
-      out->mutable_data<T>({batch_size * output_height * output_width,
-                            img_channels * kernels[0] * kernels[1]},
-                           ctx.GetPlace());
+      out->mutable_data<T>(
+          {static_cast<int64_t>(batch_size) * output_height * output_width,
+           static_cast<int64_t>(img_channels) * kernels[0] * kernels[1]},
+          ctx.GetPlace());
       const std::vector<int> dilations({1, 1});
       auto out_dims = out->dims();
       out->Resize({batch_size, out->numel() / batch_size});
@@ -156,7 +158,7 @@ class Im2SequenceGradKernel : public framework::OpKernel<T> {
 
     auto x_v = framework::EigenVector<T>::Flatten(*d_x);
     auto& place = *ctx.template device_context<DeviceContext>().eigen_device();
-    x_v.device(place) = x_v.constant(0.0);
+    EigenConstant<std::decay_t<decltype(place)>, T, 1>::Eval(place, x_v, 0.0);
 
     auto in_dim = in->dims();
     int batch_size = in_dim[0];

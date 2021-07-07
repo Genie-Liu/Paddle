@@ -13,9 +13,75 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include "paddle/fluid/operators/elementwise/elementwise_min_op.h"
+
+#include <string>
+
 #include "paddle/fluid/operators/elementwise/elementwise_op.h"
+
+namespace paddle {
+namespace framework {
+class OpDesc;
+}  // namespace framework
+namespace imperative {
+class OpBase;
+}  // namespace imperative
+namespace platform {
+class CPUDeviceContext;
+struct CPUPlace;
+}  // namespace platform
+}  // namespace paddle
+
+namespace paddle {
+namespace operators {
+
+class ElementwiseMinOpMaker : public ElementwiseOpMaker {
+ protected:
+  std::string GetName() const override { return "Min"; }
+  std::string GetEquation() const override { return "Out = min(X, Y)"; }
+
+  void AddInputX() override {
+    AddInput("X", "The first tensor holding the elements to be compared.");
+  }
+
+  void AddInputY() override {
+    AddInput("Y", "The second tensor holding the elements to be compared.");
+  }
+
+  std::string GetOpFuntionality() const override {
+    return "Compare two tensors and returns a new tensor containing the "
+           "element-wise minima.";
+  }
+};
+
+template <typename T>
+class ElementwiseMinGradOpMaker : public framework::SingleGradOpMaker<T> {
+ public:
+  using framework::SingleGradOpMaker<T>::SingleGradOpMaker;
+
+ protected:
+  void Apply(GradOpPtr<T> op) const override {
+    op->SetType("elementwise_min_grad");
+    op->SetInput("X", this->Input("X"));
+    op->SetInput("Y", this->Input("Y"));
+    op->SetInput(framework::GradVarName("Out"), this->OutputGrad("Out"));
+    op->SetOutput(framework::GradVarName("X"), this->InputGrad("X"));
+    op->SetOutput(framework::GradVarName("Y"), this->InputGrad("Y"));
+    op->SetAttrMap(this->Attrs());
+  }
+};
+
+}  // namespace operators
+}  // namespace paddle
+
 namespace ops = paddle::operators;
-REGISTER_ELEMWISE_OP(elementwise_min, "Min", "Out = min(X, Y)");
+
+REGISTER_OPERATOR(elementwise_min, ops::ElementwiseOp,
+                  ops::ElementwiseMinOpMaker, ops::ElementwiseOpInferVarType,
+                  ops::ElementwiseMinGradOpMaker<paddle::framework::OpDesc>,
+                  ops::ElementwiseMinGradOpMaker<paddle::imperative::OpBase>);
+
+REGISTER_OPERATOR(elementwise_min_grad, ops::ElementwiseOpGrad);
+
 REGISTER_OP_CPU_KERNEL(
     elementwise_min,
     ops::ElementwiseMinKernel<paddle::platform::CPUDeviceContext, float>,
@@ -28,3 +94,12 @@ REGISTER_OP_CPU_KERNEL(
     ops::ElementwiseMinGradKernel<paddle::platform::CPUDeviceContext, double>,
     ops::ElementwiseMinGradKernel<paddle::platform::CPUDeviceContext, int>,
     ops::ElementwiseMinGradKernel<paddle::platform::CPUDeviceContext, int64_t>);
+
+REGISTER_OP_VERSION(elementwise_min)
+    .AddCheckpoint(
+        R"ROC(Register elementwise_min for adding the attribute of Scale_y)ROC",
+        paddle::framework::compatible::OpVersionDesc().NewAttr(
+            "Scale_y",
+            "In order to support the function of scaling the input Y when "
+            "using the operator of elementwise_min.",
+            1.0f));

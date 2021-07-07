@@ -12,30 +12,44 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
 
-#include "paddle/fluid/framework/ir/sync_batch_norm_pass.h"
-#include <memory>
-#include <string>
-#include <utility>
+#include "glog/logging.h"
+#include "paddle/fluid/framework/ir/pass.h"
 
 namespace paddle {
 namespace framework {
 namespace ir {
 
-void SyncBatchNormPass::ApplyImpl(ir::Graph* graph) const {
-  VLOG(3) << "Use synchronous batch norm";
-  for (const Node* n : graph->Nodes()) {
-    if (n->IsOp()) {
-      auto* op = n->Op();
-      if (op->Type() == "batch_norm") {
-        op->SetType("sync_batch_norm");
-      }
-      if (op->Type() == "batch_norm_grad") {
-        op->SetType("sync_batch_norm_grad");
+class Graph;
+
+class SyncBatchNormPass : public Pass {
+ protected:
+  void ApplyImpl(ir::Graph *graph) const override {
+#if defined(_WIN32)
+    VLOG(3) << "Not use synchronize batch norm on windows";
+    return;
+#endif
+    VLOG(3) << "Use synchronize batch norm";
+    for (const Node *n : graph->Nodes()) {
+      if (n->IsOp() && n->Op()) {
+        auto *op = n->Op();
+        // process synchronize in batch_norm
+        if (op->Type() == "batch_norm") {
+          op->SetType("sync_batch_norm");
+        }
+        if (op->Type() == "batch_norm_grad") {
+          op->SetType("sync_batch_norm_grad");
+        }
+        // process synchronize in inplace_abn
+        if (op->Type() == "inplace_abn") {
+          op->SetAttr("use_sync_bn", true);
+        }
+        if (op->Type() == "inplace_abn_grad") {
+          op->SetAttr("use_sync_bn", true);
+        }
       }
     }
   }
-}
-
+};
 }  // namespace ir
 }  // namespace framework
 }  // namespace paddle

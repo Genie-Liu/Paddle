@@ -14,11 +14,12 @@ limitations under the License. */
 
 #pragma once
 
+#include <stdint.h>
 #include <memory>
 #include <string>
 #include <vector>
+
 #include "paddle/fluid/framework/block_desc.h"
-#include "paddle/fluid/framework/framework.pb.h"
 #include "paddle/fluid/framework/proto_desc.h"
 #include "paddle/fluid/platform/macros.h"
 
@@ -57,7 +58,11 @@ class ProgramDesc {
 
   proto::ProgramDesc *Proto();
 
+  proto::OpVersionMap *OpVersionMap();
+
   int64_t Version() const;
+
+  void SetVersion(const int64_t version);
 
   // The output variable of feed_op is referenced as feed_target.
   // This function is used to collect the output variable's name of all

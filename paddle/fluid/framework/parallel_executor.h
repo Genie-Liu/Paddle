@@ -23,14 +23,17 @@ limitations under the License. */
 
 #include "paddle/fluid/framework/details/build_strategy.h"
 #include "paddle/fluid/framework/details/execution_strategy.h"
+#include "paddle/fluid/framework/details/op_handle_base.h"
+#include "paddle/fluid/framework/details/scope_buffered_ssa_graph_executor.h"
 #include "paddle/fluid/framework/executor.h"
+#include "paddle/fluid/framework/feed_fetch_type.h"
 #include "paddle/fluid/framework/op_info.h"
 #include "paddle/fluid/framework/program_desc.h"
 #include "paddle/fluid/framework/scope.h"
 #include "paddle/fluid/framework/tensor.h"
 #include "paddle/fluid/platform/device_context.h"
 
-#if defined(PADDLE_WITH_CUDA) && !defined(_WIN32)
+#if defined(PADDLE_WITH_NCCL) || defined(PADDLE_WITH_RCCL)
 #include "paddle/fluid/platform/nccl_helper.h"
 #endif
 
@@ -39,8 +42,11 @@ namespace framework {
 
 class ParallelExecutorPrivate;
 
+using details::VariableInfo;
 using details::BuildStrategy;
 using details::ExecutionStrategy;
+namespace p = paddle::platform;
+using DeviceType = paddle::platform::DeviceType;
 
 class ParallelExecutor {
   DISABLE_COPY_AND_ASSIGN(ParallelExecutor);
@@ -56,7 +62,14 @@ class ParallelExecutor {
 
   ~ParallelExecutor();
 
+  size_t DeviceCount() const;
+
   std::vector<Scope *> &GetLocalScopes();
+
+  void DropLocalExeScopes();
+
+  // This API is used to check whether DropLocalExeScopes work.
+  bool NeedCreateLocalExeScope();
 
   /**
    * Feed tensors to local scopes. The size of tensors should be equal to the
@@ -68,8 +81,10 @@ class ParallelExecutor {
   void FeedAndSplitTensorIntoLocalScopes(
       const std::unordered_map<std::string, LoDTensor> &tensors);
 
-  void Run(const std::vector<std::string> &fetch_tensors,
-           const std::string &fetched_var_name);
+  FetchResultType Run(const std::vector<std::string> &fetch_tensors,
+                      bool return_merged = true);
+
+  const ir::Graph &Graph() const;
 
  private:
   // broadcast the parameters from the 0th device.
@@ -80,11 +95,42 @@ class ParallelExecutor {
                                     const ExecutionStrategy &exec_strategy,
                                     const BuildStrategy &build_strategy) const;
 
-  ParallelExecutorPrivate *member_;
-#if defined(PADDLE_WITH_CUDA) && !defined(_WIN32)
-  std::unique_ptr<ncclUniqueId> local_nccl_id_;
-#endif
-};
+  void InitExecutorPrivateMemberInfo(const ExecutionStrategy &exec_strategy,
+                                     const BuildStrategy &build_strategy,
+                                     size_t device_count,
+                                     const ir::Graph &graph);
 
+  void CreateLocalScopes(Scope *global_scope,
+                         const std::vector<Scope *> &local_scopes,
+                         bool create_new);
+
+  std::unordered_map<Scope *, Scope *> CreateLocalExecScopes(
+      const std::vector<Scope *> &local_scopes, bool create_new);
+
+  std::vector<ir::Graph *> CloneGraphToMultiDevices(ir::Graph *graph);
+
+  void PrepareNCCLCommunicator(Scope *global_scope);
+
+  std::vector<ir::Graph *> CompileGraphWithBuildStrategy(
+      ir::Graph *graph, std::vector<ir::Graph *> *graphs,
+      const std::string &loss_var_name);
+
+  void CreateVariableInfos(std::vector<VariableInfo> *var_infos,
+                           ir::Graph *graph);
+
+  std::vector<ir::Graph *> CreateSSAGraphExecutor(
+      const ExecutionStrategy &exec_strategy,
+      std::vector<ir::Graph *> *async_graphs, ir::Graph *graph);
+
+  void ResetOpHandleScopeMapOfGraphs(
+      const std::vector<ir::Graph *> &final_graphs,
+      const std::unordered_map<Scope *, Scope *> &scope_map);
+
+  void SetReaderOpDeviceInfoOfGraphs(
+      const std::vector<ir::Graph *> &final_graphs);
+
+  ParallelExecutorPrivate *member_;
+  std::vector<std::unique_ptr<ir::Graph>> async_graphs_;
+};
 }  // namespace framework
 }  // namespace paddle

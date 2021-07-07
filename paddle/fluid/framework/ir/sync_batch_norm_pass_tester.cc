@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "paddle/fluid/framework/ir/sync_batch_norm_pass.h"
 #include <gtest/gtest.h>
+#include <string>
+
+#include "paddle/fluid/framework/ir/pass.h"
+#include "paddle/fluid/framework/program_desc.h"
+#include "paddle/fluid/platform/enforce.h"
 
 namespace paddle {
 namespace framework {
@@ -65,7 +69,7 @@ TEST(IsTestPass, basic) {
   for (auto* node : graph->Nodes()) {
     if (node->IsOp()) {
       auto* op = node->Op();
-      auto op_name = boost::get<std::string>(op->GetAttr("name"));
+      auto op_name = BOOST_GET_CONST(std::string, op->GetAttr("name"));
       if (op_name == "bn") {
         ASSERT_EQ(op->Type(), "sync_batch_norm");
       }

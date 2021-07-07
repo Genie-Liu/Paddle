@@ -40,8 +40,7 @@ namespace tensorrt {
  * Get a random float value between [low, high]
  */
 float random(float low, float high) {
-  static std::random_device rd;
-  static std::mt19937 mt(rd());
+  static std::mt19937 mt(100);
   std::uniform_real_distribution<double> dist(low, high);
   return dist(mt);
 }
@@ -50,7 +49,10 @@ void RandomizeTensor(framework::LoDTensor* tensor, const platform::Place& place,
                      const platform::DeviceContext& ctx) {
   auto dims = tensor->dims();
   size_t num_elements = analysis::AccuDims(dims, dims.size());
-  PADDLE_ENFORCE_GT(num_elements, 0);
+  PADDLE_ENFORCE_GT(
+      num_elements, 0UL,
+      platform::errors::PermissionDenied("RandomizeTensor only can be used for "
+                                         "tensor which dims is not zero."));
 
   platform::CPUPlace cpu_place;
   framework::LoDTensor temp_tensor;
@@ -80,9 +82,9 @@ class TRTConvertValidation {
         scope_(scope),
         if_add_batch_(if_add_batch),
         max_batch_size_(max_batch_size) {
-    PADDLE_ENFORCE_EQ(cudaStreamCreate(&stream_), 0);
-    engine_.reset(
-        new TensorRTEngine(max_batch_size, workspace_size, false, nullptr, 0));
+    PADDLE_ENFORCE_EQ(cudaStreamCreate(&stream_), 0,
+                      platform::errors::External("cudaStreamCreate error."));
+    engine_.reset(new TensorRTEngine(max_batch_size, workspace_size));
     engine_->InitNetwork();
   }
 
@@ -103,7 +105,7 @@ class TRTConvertValidation {
     DeclVar(name, dim_vec);
   }
 
-  // Declare a parameter varaible in the scope.
+  // Declare a parameter variable in the scope.
   void DeclParamVar(const std::string& name, const nvinfer1::Dims& dims) {
     DeclVar(name, dims, true);
   }
@@ -156,10 +158,15 @@ class TRTConvertValidation {
   void Execute(int batch_size,
                std::unordered_set<std::string> neglected_output = {}) {
     // Execute Fluid Op
-    PADDLE_ENFORCE_LE(batch_size, max_batch_size_);
+    PADDLE_ENFORCE_LE(batch_size, max_batch_size_,
+                      platform::errors::InvalidArgument(
+                          "Runtime batch_size should be less than or equal to "
+                          "max_batch_size_. "
+                          "But received batch_size:%d, max_batch_size_:%d",
+                          batch_size, max_batch_size_));
     platform::CUDADeviceContext ctx(place_);
     op_->Run(scope_, place_);
-
+    cudaStreamSynchronize(stream_);
     std::vector<std::string> input_output_names;
 
     // Note: we need filter the parameter
@@ -194,6 +201,7 @@ class TRTConvertValidation {
 
     // Execute TRT.
     engine_->Execute(batch_size, &buffers, stream_);
+    cudaStreamSynchronize(stream_);
 
     ASSERT_FALSE(op_desc_->OutputArgumentNames().empty());
     int index = 0;

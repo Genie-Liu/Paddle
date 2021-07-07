@@ -21,9 +21,9 @@ from collections import defaultdict
 
 import paddle.fluid.core as core
 import paddle.fluid.proto.framework_pb2 as framework_pb2
+from paddle.fluid.log_helper import get_logger
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger = get_logger(__name__, logging.INFO)
 
 try:
     from .graphviz import Graph
@@ -102,11 +102,11 @@ def parse_graph(program, graph, var_dict, **kwargs):
 
 def draw_graph(startup_program, main_program, **kwargs):
     if "graph_attr" in kwargs:
-        GRAPH_STYLE.update(kwargs[graph_attr])
+        GRAPH_STYLE.update(kwargs["graph_attr"])
     if "node_attr" in kwargs:
-        OP_STYLE.update(kwargs[node_attr])
+        OP_STYLE.update(kwargs["node_attr"])
     if "edge_attr" in kwargs:
-        VAR_STYLE.update(kwargs[edge_attr])
+        VAR_STYLE.update(kwargs["edge_attr"])
 
     graph_id = unique_id()
     filename = kwargs.get("filename")

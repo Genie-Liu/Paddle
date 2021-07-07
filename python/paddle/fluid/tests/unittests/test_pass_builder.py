@@ -14,6 +14,7 @@
 
 from __future__ import print_function
 
+from simple_nets import simple_fc_net
 import paddle.fluid as fluid
 import paddle.fluid.core as core
 from paddle.fluid import compiler
@@ -22,23 +23,7 @@ import unittest
 import os
 import sys
 import math
-
-
-def simple_fc_net():
-    img = fluid.layers.data(name='image', shape=[784], dtype='float32')
-    label = fluid.layers.data(name='label', shape=[1], dtype='int64')
-    hidden = img
-    for _ in range(4):
-        hidden = fluid.layers.fc(
-            hidden,
-            size=200,
-            act='tanh',
-            bias_attr=fluid.ParamAttr(
-                initializer=fluid.initializer.Constant(value=1.0)))
-    prediction = fluid.layers.fc(hidden, size=10, act='softmax')
-    loss = fluid.layers.cross_entropy(input=prediction, label=label)
-    loss = fluid.layers.mean(loss)
-    return loss
+import tempfile
 
 
 class TestPassBuilder(unittest.TestCase):
@@ -114,15 +99,17 @@ class TestPassBuilder(unittest.TestCase):
 
         pass_builder.remove_pass(len(pass_builder.all_passes()) - 1)
         self.assertEqual(origin_len + 1, len(pass_builder.all_passes()))
-        viz_pass.set("graph_viz_path", "/tmp/test_viz_pass")
+        with tempfile.TemporaryDirectory(prefix="dot_path_") as tmpdir:
+            graph_viz_path = os.path.join(tmpdir, 'test_viz_pass.dot')
+            viz_pass.set("graph_viz_path", graph_viz_path)
 
-        self.check_network_convergence(
-            use_cuda=core.is_compiled_with_cuda(),
-            build_strategy=build_strategy)
-        try:
-            os.stat("/tmp/test_viz_pass")
-        except os.error:
-            self.assertFalse(True)
+            self.check_network_convergence(
+                use_cuda=core.is_compiled_with_cuda(),
+                build_strategy=build_strategy)
+            try:
+                os.stat(graph_viz_path)
+            except os.error:
+                self.assertFalse(True)
 
 
 if __name__ == '__main__':

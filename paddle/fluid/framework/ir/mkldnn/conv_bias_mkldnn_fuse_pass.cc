@@ -13,20 +13,149 @@
 // limitations under the License.
 
 #include "paddle/fluid/framework/ir/mkldnn/conv_bias_mkldnn_fuse_pass.h"
+
 #include <functional>
-#include <string>
 #include <vector>
+
 #include "paddle/fluid/framework/lod_tensor.h"
+#include "paddle/fluid/framework/op_version_registry.h"
 #include "paddle/fluid/platform/enforce.h"
 
 namespace paddle {
 namespace framework {
 namespace ir {
 
+ConvBiasFusePass::ConvBiasFusePass() {
+  AddOpCompat(OpCompat("conv2d"))
+      .AddInput("Input")
+      .IsTensor()
+      .End()
+      .AddInput("Filter")
+      .IsTensor()
+      .End()
+      .AddInput("Bias")
+      .IsTensor()
+      .IsOptional()
+      .End()
+      .AddOutput("Output")
+      .IsTensor()
+      .End()
+      .AddAttr("strides")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("paddings")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("padding_algorithm")
+      .IsStringIn({"EXPLICIT", "SAME", "VALID"})
+      .End()
+      .AddAttr("groups")
+      .IsNumGE(1)
+      .End()
+      .AddAttr("dilations")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("data_format")
+      .IsStringIn({"NCHW", "NHWC"})
+      .End();
+
+  AddOpCompat(OpCompat("elementwise_add"))
+      .AddInput("X")
+      .IsTensor()
+      .End()
+      .AddInput("Y")
+      .IsTensor()
+      .End()
+      .AddOutput("Out")
+      .IsTensor()
+      .End()
+      .AddAttr("axis")
+      .IsIntIn({-1, 0})
+      .End();
+}
+
+Conv2DTransposeBiasFusePass::Conv2DTransposeBiasFusePass() {
+  AddOpCompat(OpCompat("conv2d_transpose"))
+      .AddInput("Input")
+      .IsTensor()
+      .End()
+      .AddInput("Filter")
+      .IsTensor()
+      .End()
+      .AddInput("Bias")
+      .IsTensor()
+      .IsOptional()
+      .End()
+      .AddOutput("Output")
+      .IsTensor()
+      .End()
+      .AddAttr("output_padding")
+      .IsType<std::vector<int>>()
+      .IsOptional()
+      .End()
+      .AddAttr("output_size")
+      .IsType<std::vector<int>>()
+      .IsOptional()
+      .End()
+      .AddAttr("groups")
+      .IsNumGE(1)
+      .End()
+      .AddAttr("dilations")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("strides")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("paddings")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("padding_algorithm")
+      .IsStringIn({"EXPLICIT", "SAME", "VALID"})
+      .End()
+      .AddAttr("data_format")
+      .IsStringIn({"NCHW", "NHWC", "AnyLayout"})
+      .End();
+}
+
+Conv3DBiasFusePass::Conv3DBiasFusePass() {
+  AddOpCompat(OpCompat("conv3d"))
+      .AddInput("Input")
+      .IsTensor()
+      .End()
+      .AddInput("Filter")
+      .IsTensor()
+      .End()
+      .AddOutput("Output")
+      .IsTensor()
+      .End()
+      .AddAttr("strides")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("paddings")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("padding_algorithm")
+      .IsStringIn({"EXPLICIT", "SAME", "VALID"})
+      .End()
+      .AddAttr("groups")
+      .IsNumGE(1)
+      .End()
+      .AddAttr("dilations")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("data_format")
+      .IsStringIn({"NCHW", "NHWC"})
+      .End();
+}
+
 template <typename BinaryOperation>
 LoDTensor tensor_apply_eltwise(const LoDTensor& vec_a, const LoDTensor& vec_b,
                                BinaryOperation f) {
-  PADDLE_ENFORCE_EQ(vec_a.dims(), vec_b.dims());
+  PADDLE_ENFORCE_EQ(vec_a.dims(), vec_b.dims(),
+                    platform::errors::InvalidArgument(
+                        "Input two tensors must have same shape, but they are "
+                        "different: %s, %s.",
+                        vec_a.dims(), vec_b.dims()));
   LoDTensor vec_y;
   vec_y.Resize(vec_a.dims());
   const float* a = vec_a.data<float>();
@@ -39,22 +168,22 @@ LoDTensor tensor_apply_eltwise(const LoDTensor& vec_a, const LoDTensor& vec_b,
 }
 
 void ConvBiasFusePass::ApplyImpl(ir::Graph* graph) const {
-  PADDLE_ENFORCE(graph);
+  PADDLE_ENFORCE_NOT_NULL(
+      graph, platform::errors::InvalidArgument("Graph cannot be nullptr."));
   FusePassBase::Init(name_scope_, graph);
 
   auto* scope = param_scope();
-  PADDLE_ENFORCE(scope);
-
-  std::string type = is_conv3d() ? "conv3d" : "conv2d";
+  PADDLE_ENFORCE_NOT_NULL(
+      scope, platform::errors::InvalidArgument("Scope cannot be nullptr."));
 
   GraphPatternDetector gpd;
   auto* conv_input =
       gpd.mutable_pattern()
           ->NewNode(patterns::PDNodeName(name_scope_, "conv_input"))
           ->AsInput()
-          ->assert_is_op_input(type, "Input");
+          ->assert_is_op_input(type(), "Input");
   patterns::ConvBias conv_bias_pattern(gpd.mutable_pattern(), name_scope_);
-  conv_bias_pattern(conv_input, is_conv3d());
+  conv_bias_pattern(conv_input, type());
   int found_conv_bias_count = 0;
   auto handler = [&](const GraphPatternDetector::subgraph_t& subgraph,
                      Graph* g) {
@@ -70,12 +199,20 @@ void ConvBiasFusePass::ApplyImpl(ir::Graph* graph) const {
     // elementwise_add op
     GET_IR_NODE_FROM_SUBGRAPH(eltwise, eltwise, conv_bias_pattern);
 
-    PADDLE_ENFORCE(subgraph.count(conv_input));
+    PADDLE_ENFORCE_NE(
+        subgraph.count(conv_input), 0,
+        platform::errors::NotFound("Detector did not find conv input."));
+
+    // check compat
+    if (!IsCompat(subgraph, g)) {
+      VLOG(3) << "Pass in op compat failed.";
+      return;
+    }
 
     // check if fuse can be done and if MKL-DNN should be used
     FuseOptions fuse_option = FindFuseOption(*conv, *eltwise);
     if (fuse_option == DO_NOT_FUSE || fuse_option == FUSE_NATIVE) {
-      VLOG(3) << "do not perform conv+bias fuse";
+      VLOG(3) << "do not perform " + type() + "+bias fuse";
       return;
     }
 
@@ -88,10 +225,16 @@ void ConvBiasFusePass::ApplyImpl(ir::Graph* graph) const {
     if (has_bias && conv->Op()->Input("Bias").size() > 0) {
       auto conv_bias_names = conv->Op()->Input("Bias");
       // add eltwise bias to existing conv bias
-      PADDLE_ENFORCE_EQ(conv_bias_names.size(), 1);
+      PADDLE_ENFORCE_EQ(conv_bias_names.size(), 1,
+                        platform::errors::NotFound("Can not find var Bias."));
       auto* conv_bias_var = scope->FindVar(conv_bias_names[0]);
       auto* conv_bias_tensor = conv_bias_var->GetMutable<LoDTensor>();
-      PADDLE_ENFORCE_EQ(conv_bias_tensor->dims(), eltwise_bias_tensor->dims());
+      PADDLE_ENFORCE_EQ(
+          conv_bias_tensor->dims(), eltwise_bias_tensor->dims(),
+          platform::errors::InvalidArgument(
+              "Conv bias tensor and eltwise bias tensor "
+              "must have same shape, but they are different: %s, %s.",
+              conv_bias_tensor->dims(), eltwise_bias_tensor->dims()));
       *conv_bias_tensor = tensor_apply_eltwise(
           *conv_bias_tensor, *eltwise_bias_tensor, std::plus<float>());
 
@@ -110,7 +253,7 @@ void ConvBiasFusePass::ApplyImpl(ir::Graph* graph) const {
       desc.SetInput("Filter", std::vector<std::string>({conv_weight->Name()}));
       desc.SetInput("Bias", std::vector<std::string>({eltwise_bias->Name()}));
       desc.SetOutput("Output", std::vector<std::string>({eltwise_out->Name()}));
-      desc.SetType(type);
+      desc.SetType(type());
 
       for (auto& attr : conv->Op()->GetAttrMap()) {
         desc.SetAttr(attr.first, attr.second);
@@ -135,5 +278,19 @@ void ConvBiasFusePass::ApplyImpl(ir::Graph* graph) const {
 }  // namespace paddle
 REGISTER_PASS(conv_bias_mkldnn_fuse_pass,
               paddle::framework::ir::ConvBiasFusePass);
+REGISTER_PASS_CAPABILITY(conv_bias_mkldnn_fuse_pass)
+    .AddCombination(
+        paddle::framework::compatible::OpVersionComparatorCombination()
+            .LE("conv2d", 1)
+            .LE("elementwise_add", 1));
+
+REGISTER_PASS(conv_transpose_bias_mkldnn_fuse_pass,
+              paddle::framework::ir::Conv2DTransposeBiasFusePass);
+REGISTER_PASS_CAPABILITY(conv_transpose_bias_mkldnn_fuse_pass)
+    .AddCombination(
+        paddle::framework::compatible::OpVersionComparatorCombination()
+            .LE("conv2d_transpose", 2)
+            .LE("elementwise_add", 1));
+
 REGISTER_PASS(conv3d_bias_mkldnn_fuse_pass,
               paddle::framework::ir::Conv3DBiasFusePass);

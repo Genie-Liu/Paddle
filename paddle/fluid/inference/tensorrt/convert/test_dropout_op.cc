@@ -25,15 +25,15 @@ TEST(DropoutOpConverter, main) {
   TRTConvertValidation validator(8, parameters, scope, 1000);
 
   std::vector<int> tensor_shape{8, 10};
-  validator.DeclInputVar("dropout-X", tensor_shape,
-                         nvinfer1::DimsCHW(10, 1, 1));
-  validator.DeclOutputVar("dropout-Out", nvinfer1::DimsCHW(10, 1, 1));
-  validator.DeclOutputVar("mask-Out", nvinfer1::DimsCHW(10, 1, 1));
+  validator.DeclInputVar("dropout-X", tensor_shape, nvinfer1::Dims3(10, 1, 1));
+  validator.DeclOutputVar("dropout-Out", nvinfer1::Dims3(10, 1, 1));
+  validator.DeclOutputVar("mask-Out", nvinfer1::Dims3(10, 1, 1));
 
   // Prepare Op description
   framework::OpDesc desc;
   int is_test = 1;
   float dropout_prob = 0.4;
+  std::string dropout_implementation = "upscale_in_train";
 
   desc.SetType("dropout");
   desc.SetInput("X", {"dropout-X"});
@@ -41,6 +41,8 @@ TEST(DropoutOpConverter, main) {
   desc.SetOutput("Out", {"dropout-Out"});
   desc.SetAttr("is_test", is_test);
   desc.SetAttr("dropout_prob", dropout_prob);
+
+  desc.SetAttr("dropout_implementation", dropout_implementation);
 
   LOG(INFO) << "set OP";
   validator.SetOp(*desc.Proto());

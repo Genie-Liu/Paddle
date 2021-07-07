@@ -16,6 +16,7 @@ limitations under the License. */
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -24,15 +25,50 @@ limitations under the License. */
 #include <unordered_set>
 
 #define GLOG_NO_ABBREVIATED_SEVERITIES  // msvc conflict logging with windows.h
-#include "glog/logging.h"               // For VLOG()
+#include "gflags/gflags.h"
+#include "glog/logging.h"  // For VLOG()
 #include "paddle/fluid/framework/attribute.h"
 #include "paddle/fluid/framework/details/op_registry.h"
-#include "paddle/fluid/framework/framework.pb.h"
 #include "paddle/fluid/framework/grad_op_desc_maker.h"
 #include "paddle/fluid/framework/op_desc.h"
 #include "paddle/fluid/framework/operator.h"
 #include "paddle/fluid/framework/scope.h"
 #include "paddle/fluid/framework/shape_inference.h"
+
+namespace paddle {
+namespace framework {
+class ExecutionContext;
+}  // namespace framework
+}  // namespace paddle
+
+namespace paddle {
+namespace framework {
+namespace proto {
+
+class BlockDesc;
+class OpDesc;
+class OpDesc_Attr;
+class OpDesc_Var;
+class OpProto;
+class OpProto_Attr;
+class OpProto_Var;
+class OpVersion;
+class OpVersionMap;
+class OpVersionMap_OpVersionPair;
+class ProgramDesc;
+class VarDesc;
+class VarType;
+class VarType_LoDTensorArrayDesc;
+class VarType_LoDTensorDesc;
+class VarType_ReaderDesc;
+class VarType_TensorDesc;
+class VarType_Tuple;
+class Version;
+}  // namespace proto
+}  // namespace framework
+}  // namespace paddle
+
+DECLARE_bool(check_kernel_launch);
 
 namespace paddle {
 namespace framework {
@@ -53,8 +89,10 @@ class Registrar {
 template <typename... ARGS>
 struct OperatorRegistrar : public Registrar {
   explicit OperatorRegistrar(const char* op_type) {
-    PADDLE_ENFORCE(!OpInfoMap::Instance().Has(op_type),
-                   "'%s' is registered more than once.", op_type);
+    PADDLE_ENFORCE_EQ(
+        OpInfoMap::Instance().Has(op_type), false,
+        platform::errors::AlreadyExists(
+            "Operator '%s' is registered more than once.", op_type));
     static_assert(sizeof...(ARGS) != 0,
                   "OperatorRegistrar should be invoked at least by OpClass");
     OpInfo info;
@@ -65,15 +103,52 @@ struct OperatorRegistrar : public Registrar {
 
 class OpRegistry {
  public:
+  /**
+   * @brief Return an OperatorBase constructed by type, inputs, outputs, attrs.
+   *        In dygraph mode, inputs, output, attrs will be set to empty map to
+   *        improve the execution efficiency of dygraph.
+   *        Dygraph mode will use:
+   *        framework::OpRegistry::CreateOp(type, {}, {}, {}, false).
+   *
+   * @param[str] type               The operator type.
+   * @param[map] inputs             Inputs map of the operator.
+   * @param[map] outputs            Outputs map of the operator.
+   * @param[unordered_map] attrs    Attributes map of the operator.
+   * @param[bool] attr_check
+   *            Whether do the attribute check before OperatorBase construction.
+   *            Default is true.
+   *            Attr_check is used to control the check of attribute map.
+   *            The check of attribute map have two purposes:
+   *            1. check whether the attribute item is valid or not.
+   *            2. add attribute item which has default value
+   *            if it is not in attrs.
+   *            In dygraph mode, attrs is an empty unordered_map,
+   *            attr_check is set to false, otherwise it will be failed
+   *            when check function called.
+   */
   static std::unique_ptr<OperatorBase> CreateOp(const std::string& type,
                                                 const VariableNameMap& inputs,
                                                 const VariableNameMap& outputs,
-                                                AttributeMap attrs);
+                                                AttributeMap attrs,
+                                                bool attr_check = true);
 
   static std::unique_ptr<OperatorBase> CreateOp(const proto::OpDesc& op_desc);
 
   static std::unique_ptr<OperatorBase> CreateOp(const OpDesc& op_desc);
 };
+
+template <typename PlaceType>
+inline void CheckKernelLaunch(const char* op_type) {}
+
+#ifdef PADDLE_WITH_CUDA
+template <>
+inline void CheckKernelLaunch<::paddle::platform::CUDAPlace>(
+    const char* op_type) {
+  if (FLAGS_check_kernel_launch) {
+    PADDLE_ENFORCE_CUDA_LAUNCH_SUCCESS(op_type);
+  }
+}
+#endif
 
 template <typename PlaceType, bool at_end, size_t I, typename... KernelType>
 struct OpKernelRegistrarFunctor;
@@ -103,8 +178,9 @@ struct OpKernelRegistrarFunctor<PlaceType, false, I, KernelTypes...> {
     RegisterKernelClass<PlaceType, T>(
         op_type, library_type, customized_type_value,
 
-        [](const framework::ExecutionContext& ctx) {
+        [op_type](const framework::ExecutionContext& ctx) {
           KERNEL_TYPE().Compute(ctx);
+          CheckKernelLaunch<PlaceType>(op_type);
         });
     constexpr auto size = std::tuple_size<std::tuple<KernelTypes...>>::value;
     OpKernelRegistrarFunctor<PlaceType, I + 1 == size, I + 1, KernelTypes...>
@@ -164,8 +240,13 @@ struct OpKernelRegistrarFunctorEx<PlaceType, false, I,
 
   void operator()(const char* op_type, const char* library_type,
                   int customized_type_value) const {
-    RegisterKernelClass<PlaceType, T>(op_type, library_type,
-                                      customized_type_value, Functor());
+    RegisterKernelClass<PlaceType, T>(
+        op_type, library_type, customized_type_value,
+
+        [op_type](const framework::ExecutionContext& ctx) {
+          Functor()(ctx);
+          CheckKernelLaunch<PlaceType>(op_type);
+        });
 
     constexpr auto size =
         std::tuple_size<std::tuple<DataTypeAndKernelType...>>::value;
@@ -206,7 +287,9 @@ struct OpKernelRegistrarFunctorEx<PlaceType, false, I,
   }
 
 #define REGISTER_OP_WITHOUT_GRADIENT(op_type, op_class, op_maker_class) \
-  REGISTER_OPERATOR(op_type, op_class, op_maker_class)
+  REGISTER_OPERATOR(op_type, op_class, op_maker_class, \
+        paddle::framework::EmptyGradOpMaker<paddle::framework::OpDesc>,   \
+        paddle::framework::EmptyGradOpMaker<paddle::imperative::OpBase>)
 
 /**
  * Macro to register OperatorKernel.
@@ -234,11 +317,21 @@ struct OpKernelRegistrarFunctorEx<PlaceType, false, I,
       ::paddle::framework::OpKernelType::kDefaultCustomizedTypeValue, \
       __VA_ARGS__)
 
+#if defined(PADDLE_WITH_CUDA) || defined(PADDLE_WITH_HIP)
 #define REGISTER_OP_CUDA_KERNEL(op_type, ...) \
   REGISTER_OP_KERNEL(op_type, CUDA, ::paddle::platform::CUDAPlace, __VA_ARGS__)
+#else
+#define REGISTER_OP_CUDA_KERNEL(op_type, ...)
+#endif
 
 #define REGISTER_OP_CPU_KERNEL(op_type, ...) \
   REGISTER_OP_KERNEL(op_type, CPU, ::paddle::platform::CPUPlace, __VA_ARGS__)
+
+#define REGISTER_OP_XPU_KERNEL(op_type, ...) \
+  REGISTER_OP_KERNEL(op_type, XPU, ::paddle::platform::XPUPlace, __VA_ARGS__)
+
+#define REGISTER_OP_NPU_KERNEL(op_type, ...) \
+  REGISTER_OP_KERNEL(op_type, NPU, ::paddle::platform::NPUPlace, __VA_ARGS__)
 
 #define REGISTER_OP_KERNEL_EX(op_type, library_type, place_class,  \
                               customized_name,                     \
@@ -267,6 +360,18 @@ struct OpKernelRegistrarFunctorEx<PlaceType, false, I,
 #define REGISTER_OP_CPU_KERNEL_FUNCTOR(op_type, ...)                  \
   REGISTER_OP_KERNEL_EX(                                              \
       op_type, CPU, ::paddle::platform::CPUPlace, DEFAULT_TYPE,       \
+      ::paddle::framework::OpKernelType::kDefaultCustomizedTypeValue, \
+      __VA_ARGS__)
+
+#define REGISTER_OP_XPU_KERNEL_FUNCTOR(op_type, ...)                  \
+  REGISTER_OP_KERNEL_EX(                                              \
+      op_type, XPU, ::paddle::platform::XPUPlace, DEFAULT_TYPE,       \
+      ::paddle::framework::OpKernelType::kDefaultCustomizedTypeValue, \
+      __VA_ARGS__)
+
+#define REGISTER_OP_NPU_KERNEL_FUNCTOR(op_type, ...)                  \
+  REGISTER_OP_KERNEL_EX(                                              \
+      op_type, NPU, ::paddle::platform::NPUPlace, DEFAULT_TYPE,       \
       ::paddle::framework::OpKernelType::kDefaultCustomizedTypeValue, \
       __VA_ARGS__)
 
@@ -299,7 +404,7 @@ struct OpKernelRegistrarFunctorEx<PlaceType, false, I,
 // TODO(fengjiayi): The following macros
 // seems ugly, do we have better method?
 
-#ifndef PADDLE_WITH_CUDA
+#if !defined(PADDLE_WITH_CUDA) && !defined(PADDLE_WITH_HIP)
 #define USE_OP_KERNEL(op_type) USE_OP_DEVICE_KERNEL(op_type, CPU)
 #else
 #define USE_OP_KERNEL(op_type)        \

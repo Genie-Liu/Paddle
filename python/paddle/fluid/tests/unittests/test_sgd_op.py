@@ -16,9 +16,13 @@ from __future__ import print_function
 
 import unittest
 import numpy as np
+import paddle.fluid as fluid
 import paddle.fluid.core as core
 from paddle.fluid.op import Operator
 from op_test import OpTest
+import paddle
+
+paddle.enable_static()
 
 
 class TestSGDOp(OpTest):
@@ -184,6 +188,107 @@ class TestSGDOpOptimizeSelectedRows(unittest.TestCase):
         # do not support GPU kernel currently
         for place in places:
             self.check_with_place(place)
+
+
+class TestSGDOpWithLargeInput(unittest.TestCase):
+    def runTest(self):
+        data = fluid.layers.fill_constant(shape=[1], value=128, dtype='int64')
+        label = fluid.layers.fill_constant(
+            shape=[1, 150], value=0.5, dtype='float32')
+        emb = fluid.embedding(input=data, size=(10000000, 150), dtype='float32')
+        out = fluid.layers.l2_normalize(x=emb, axis=-1)
+
+        cost = fluid.layers.square_error_cost(input=out, label=label)
+        avg_cost = fluid.layers.mean(cost)
+        sgd_optimizer = fluid.optimizer.SGD(learning_rate=0.001)
+        sgd_optimizer.minimize(avg_cost)
+
+        place = fluid.CPUPlace()
+        exe = fluid.Executor(place)
+        exe.run(fluid.default_startup_program())
+        compiled_prog = fluid.compiler.CompiledProgram(
+            fluid.default_main_program())
+        result = exe.run(compiled_prog, fetch_list=[avg_cost])
+
+
+class TestSGDV2(unittest.TestCase):
+    def test_sgd_dygraph(self):
+        paddle.disable_static()
+        value = np.arange(26).reshape(2, 13).astype("float32")
+        a = paddle.to_tensor(value)
+        linear = paddle.nn.Linear(13, 5)
+        # This can be any optimizer supported by dygraph.
+        adam = paddle.optimizer.SGD(learning_rate=0.01,
+                                    parameters=linear.parameters(),
+                                    weight_decay=0.01)
+        out = linear(a)
+        out.backward()
+        adam.step()
+        adam.clear_gradients()
+
+    def test_sgd(self):
+        paddle.enable_static()
+
+        def check_sgd_optimizer(optimizer_attr):
+            init_program = paddle.static.Program()
+            program = paddle.static.Program()
+            block = program.global_block()
+            mul_x = block.create_parameter(
+                dtype="float32",
+                shape=[5, 10],
+                lod_level=0,
+                name="mul.x",
+                optimize_attr=optimizer_attr)
+            mul_y = block.create_var(
+                dtype="float32", shape=[10, 8], lod_level=0, name="mul.y")
+            mul_out = block.create_var(
+                dtype="float32", shape=[5, 8], lod_level=0, name="mul.out")
+            mean_out = block.create_var(
+                dtype="float32", shape=[1], lod_level=0, name="mean.out")
+            block.append_op(
+                type="mul",
+                inputs={"X": mul_x,
+                        "Y": mul_y},
+                outputs={"Out": mul_out},
+                attrs={"x_num_col_dims": 1})
+            block.append_op(
+                type="mean", inputs={"X": mul_out}, outputs={"Out": mean_out})
+            sgd_optimizer = paddle.optimizer.SGD(learning_rate=0.01)
+            opts, _ = sgd_optimizer.minimize(mean_out, init_program)
+            return opts
+
+        opts = check_sgd_optimizer({'learning_rate': 1.1})
+        self.assertEqual(len(opts), 2)
+        self.assertEqual([op.type for op in opts], ["scale", "sgd"])
+
+        opts = check_sgd_optimizer({'learning_rate': 1.0})
+        self.assertEqual(len(opts), 1)
+        self.assertEqual([op.type for op in opts], ["sgd"])
+
+    def test_raise_error(self):
+        self.assertRaises(ValueError, paddle.optimizer.SGD, learning_rate=None)
+
+    def test_sgd_group_dygraph(self):
+        paddle.disable_static()
+        value = np.arange(26).reshape(2, 13).astype("float32")
+        a = paddle.to_tensor(value)
+        linear_1 = paddle.nn.Linear(13, 5)
+        linear_2 = paddle.nn.Linear(5, 3)
+        # This can be any optimizer supported by dygraph.
+        adam = paddle.optimizer.SGD(learning_rate=0.01,
+                                    parameters=[{
+                                        'params': linear_1.parameters()
+                                    }, {
+                                        'params': linear_2.parameters(),
+                                        'weight_decay': 0.001,
+                                        'learning_rate': 0.1
+                                    }],
+                                    weight_decay=0.01)
+        out = linear_1(a)
+        out = linear_2(out)
+        out.backward()
+        adam.step()
+        adam.clear_gradients()
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@
 #include <vector>
 #include "paddle/fluid/framework/eigen.h"
 #include "paddle/fluid/framework/op_registry.h"
+#include "paddle/fluid/operators/eigen/eigen_function.h"
 
 namespace paddle {
 namespace operators {
@@ -23,19 +24,24 @@ template <typename DeviceContext, typename T, int Rank>
 struct ReverseFunctor {
   void operator()(const DeviceContext& context, const framework::LoDTensor& in,
                   framework::LoDTensor* out, const std::vector<int>& axis) {
-    Eigen::array<bool, Rank> reverse_axis;
+    Eigen::DSizes<bool, Rank> reverse_axis;
     for (int i = 0; i < Rank; ++i) {
       reverse_axis[i] = false;
     }
     for (int a : axis) {
-      reverse_axis[a] = true;
+      if (a >= 0) {
+        reverse_axis[a] = true;
+      } else {
+        reverse_axis[Rank + a] = true;
+      }
     }
 
     auto in_eigen = framework::EigenTensor<T, Rank>::From(in);
     auto out_eigen = framework::EigenTensor<T, Rank>::From(*out);
-    auto* dev = context.eigen_device();
+    auto& dev = *context.eigen_device();
 
-    out_eigen.device(*dev) = in_eigen.reverse(reverse_axis);
+    EigenReverse<std::decay_t<decltype(dev)>, T, Rank>::Eval(
+        dev, out_eigen, in_eigen, reverse_axis);
   }
 };
 
@@ -43,10 +49,30 @@ template <typename DeviceContext, typename T>
 class ReverseKernel : public framework::OpKernel<T> {
  public:
   void Compute(const framework::ExecutionContext& context) const override {
+    auto* x_var = context.InputVar("X");
+    const auto& axis = context.Attr<std::vector<int>>("axis");
+    if (x_var->IsType<framework::LoDTensorArray>()) {
+      auto& x_array = x_var->Get<framework::LoDTensorArray>();
+      auto* out_array = context.Output<framework::LoDTensorArray>("Out");
+
+      out_array->resize(x_array.size());
+      for (size_t offset = 0; offset < x_array.size(); offset++) {
+        auto& x_tensor = x_array.at(offset);
+        PADDLE_ENFORCE_GT(
+            x_tensor.memory_size(), 0,
+            platform::errors::PreconditionNotMet(
+                "The input LoDTensorArray X[%d] holds no memory.", offset));
+        auto out_offset = x_array.size() - offset - 1;
+        auto* out_tensor = &out_array->at(out_offset);
+
+        out_tensor->set_lod(x_tensor.lod());
+        TensorCopy(x_tensor, context.GetPlace(), out_tensor);
+      }
+      return;
+    }
     auto* x = context.Input<framework::LoDTensor>("X");
     auto* out = context.Output<framework::LoDTensor>("Out");
     out->mutable_data<T>(context.GetPlace());
-    const auto& axis = context.Attr<std::vector<int>>("axis");
     int rank = x->dims().size();
     auto& dev_ctx = context.template device_context<DeviceContext>();
 
@@ -76,9 +102,9 @@ class ReverseKernel : public framework::OpKernel<T> {
         functor6(dev_ctx, *x, out, axis);
         break;
       default:
-        PADDLE_THROW(
-            "Reserve operator doesn't supports tensors whose ranks are greater "
-            "than 6.");
+        PADDLE_THROW(paddle::platform::errors::OutOfRange(
+            "The reserve operator does not support input tensors"
+            "whose ranks are greater than 6."));
     }
   }
 };

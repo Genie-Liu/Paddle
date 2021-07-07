@@ -19,24 +19,25 @@ import time
 import six
 import unittest
 
-EPOCH_NUM = 60
-BATCH_SIZE = 32
+EPOCH_NUM = 5
+BATCH_SIZE = 16
+BATCH_NUM = 10
 CLASS_NUM = 10
 
 
 def random_reader():
     np.random.seed(1)
-    for i in range(BATCH_SIZE * 40):
+    for i in range(BATCH_SIZE * BATCH_NUM):
         image = np.random.random([784])
-        label = np.random.random_integers(low=0, high=CLASS_NUM - 1)
+        label = np.random.randint(low=0, high=CLASS_NUM)
         yield image, label
 
 
 def simple_fc_net(places, use_legacy_py_reader, use_double_buffer):
+    paddle.seed(1)
+    paddle.framework.random._manual_program_seed(1)
     startup_prog = fluid.Program()
     main_prog = fluid.Program()
-    startup_prog.random_seed = 1
-    main_prog.random_seed = 1
 
     with fluid.unique_name.guard():
         with fluid.program_guard(main_prog, startup_prog):

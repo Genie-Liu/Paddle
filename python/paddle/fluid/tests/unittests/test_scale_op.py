@@ -17,20 +17,46 @@ from __future__ import print_function
 import unittest
 import numpy as np
 from op_test import OpTest
+import paddle
+import paddle.fluid as fluid
 import paddle.fluid.core as core
 from paddle.fluid.op import Operator
+from paddle.static import Program, program_guard
 
 
 class TestScaleOp(OpTest):
     def setUp(self):
         self.op_type = "scale"
-        self.dtype = np.float32
+        self.dtype = np.float64
         self.init_dtype_type()
         self.inputs = {'X': np.random.random((10, 10)).astype(self.dtype)}
         self.attrs = {'scale': -2.3}
         self.outputs = {
             'Out': self.inputs['X'] * self.dtype(self.attrs['scale'])
         }
+
+    def init_dtype_type(self):
+        pass
+
+    def test_check_output(self):
+        self.check_output()
+
+    def test_check_grad(self):
+        self.check_grad(['X'], 'Out')
+
+
+class TestScaleOpScaleVariable(OpTest):
+    def setUp(self):
+        self.op_type = "scale"
+        self.dtype = np.float64
+        self.init_dtype_type()
+        self.scale = -2.3
+        self.inputs = {
+            'X': np.random.random((10, 10)).astype(self.dtype),
+            'ScaleTensor': np.array([self.scale]).astype('float64')
+        }
+        self.attrs = {}
+        self.outputs = {'Out': self.inputs['X'] * self.dtype(self.scale)}
 
     def init_dtype_type(self):
         pass
@@ -49,7 +75,7 @@ class TestScaleOpSelectedRows(unittest.TestCase):
     def check_with_place(self, place, in_name, out_name):
         scope = core.Scope()
 
-        self.dtype = np.float32
+        self.dtype = np.float64
         self.init_dtype_type()
 
         # create and initialize Grad Variable
@@ -100,6 +126,14 @@ class TestScaleOpSelectedRows(unittest.TestCase):
             self.check_with_place(place, 'in', 'in')
 
 
+class TestScaleRaiseError(unittest.TestCase):
+    def test_errors(self):
+        def test_type():
+            fluid.layers.scale([10])
+
+        self.assertRaises(TypeError, test_type)
+
+
 # Add FP16 test
 @unittest.skipIf(not core.is_compiled_with_cuda(),
                  "core is not compiled with CUDA")
@@ -134,6 +168,46 @@ class TestScaleFp16OpSelectedRows(TestScaleOpSelectedRows):
         place = core.CUDAPlace(0)
         if core.is_float16_supported(place):
             self.check_with_place(place, 'in', 'in')
+
+
+class TestScaleApiStatic(unittest.TestCase):
+    def _executed_api(self, x, scale=1.0, bias=0.0):
+        return paddle.scale(x, scale, bias)
+
+    def test_api(self):
+        paddle.enable_static()
+        input = np.random.random([2, 25]).astype("float32")
+        main_prog = Program()
+        with program_guard(main_prog, Program()):
+            x = paddle.static.data(name="x", shape=[2, 25], dtype="float32")
+            out = self._executed_api(x, scale=2.0, bias=3.0)
+
+        exe = paddle.static.Executor(place=paddle.CPUPlace())
+        out = exe.run(main_prog, feed={"x": input}, fetch_list=[out])
+        self.assertEqual(np.array_equal(out[0], input * 2.0 + 3.0), True)
+
+
+class TestScaleInplaceApiStatic(TestScaleApiStatic):
+    def _executed_api(self, x, scale=1.0, bias=0.0):
+        return x.scale_(scale, bias)
+
+
+class TestScaleApiDygraph(unittest.TestCase):
+    def _executed_api(self, x, scale=1.0, bias=0.0):
+        return paddle.scale(x, scale, bias)
+
+    def test_api(self):
+        paddle.disable_static()
+        input = np.random.random([2, 25]).astype("float32")
+        x = paddle.to_tensor(input)
+        out = self._executed_api(x, scale=2.0, bias=3.0)
+        self.assertEqual(np.array_equal(out.numpy(), input * 2.0 + 3.0), True)
+        paddle.enable_static()
+
+
+class TestScaleInplaceApiDygraph(TestScaleApiDygraph):
+    def _executed_api(self, x, scale=1.0, bias=0.0):
+        return x.scale_(scale, bias)
 
 
 if __name__ == "__main__":

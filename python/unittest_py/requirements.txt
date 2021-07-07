@@ -1,0 +1,11 @@
+PyGithub
+coverage
+pycrypto ; platform_system != "Windows"
+mock
+gym
+opencv-python<=4.2.0.32
+visualdl
+paddle2onnx>=0.4
+scipy
+prettytable
+distro

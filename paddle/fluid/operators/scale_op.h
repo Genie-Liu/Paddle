@@ -16,9 +16,22 @@ limitations under the License. */
 
 #include "paddle/fluid/framework/eigen.h"
 #include "paddle/fluid/framework/op_registry.h"
+#include "paddle/fluid/operators/eigen/eigen_function.h"
 
 namespace paddle {
 namespace operators {
+
+template <typename T>
+static inline T GetAttrFromTensor(const framework::Tensor* tensor) {
+  const auto* tensor_data = tensor->data<T>();
+  framework::Tensor cpu_tensor;
+  if (platform::is_gpu_place(tensor->place())) {
+    TensorCopySync(*tensor, platform::CPUPlace(), &cpu_tensor);
+    tensor_data = cpu_tensor.data<T>();
+  }
+  return tensor_data[0];
+}
+
 template <typename DeviceContext, typename T>
 class ScaleKernel : public framework::OpKernel<T> {
  public:
@@ -26,9 +39,14 @@ class ScaleKernel : public framework::OpKernel<T> {
     auto* in_var = ctx.InputVar("X");
     auto* in = framework::GetLoDTensorOrSelectedRowsValueFromVar(*in_var);
 
-    auto scale = static_cast<T>(ctx.Attr<float>("scale"));
     auto bias = static_cast<T>(ctx.Attr<float>("bias"));
     auto bias_after_scale = ctx.Attr<bool>("bias_after_scale");
+
+    auto scale = static_cast<T>(ctx.Attr<float>("scale"));
+    if (ctx.HasInput("ScaleTensor")) {
+      auto* scale_tensor = ctx.Input<framework::Tensor>("ScaleTensor");
+      scale = GetAttrFromTensor<T>(scale_tensor);
+    }
 
     auto* out_var = ctx.OutputVar("Out");
     if (in_var->IsType<framework::SelectedRows>() && in_var != out_var) {
@@ -43,16 +61,16 @@ class ScaleKernel : public framework::OpKernel<T> {
     out->mutable_data<T>(in->place());
 
     PADDLE_ENFORCE_EQ(in->dims(), out->dims(),
-                      "in and out should have the same dim");
+                      paddle::platform::errors::InvalidArgument(
+                          "the input and output should have the same dim"
+                          "but input dim is %s, output dim is %s",
+                          in->dims(), out->dims()));
 
     auto eigen_out = framework::EigenVector<T>::Flatten(*out);
     auto eigen_in = framework::EigenVector<T>::Flatten(*in);
     auto& dev = *ctx.template device_context<DeviceContext>().eigen_device();
-    if (bias_after_scale) {
-      eigen_out.device(dev) = scale * eigen_in + bias;
-    } else {
-      eigen_out.device(dev) = scale * (eigen_in + bias);
-    }
+    EigenScale<std::decay_t<decltype(dev)>, T>::Eval(
+        dev, eigen_out, eigen_in, scale, bias, bias_after_scale);
   }
 };
 
